@@ -2,3 +2,4 @@ python-telegram-bot
 requests
 flask
 gunicorn
+deep-translator
