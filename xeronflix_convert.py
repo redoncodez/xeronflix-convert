@@ -536,9 +536,22 @@ def _check_netflix_cookie(cookie_header: str, timeout_s: int = 10) -> Dict[str, 
             or find(r'"maxStreams"\s*:\s*"?([0-9]+)"?')
         )
 
+        # Parse Explicit Payment & Account Status directly from internal state
+        payment_status_raw = find(r'"paymentStatus"\s*:\s*"([^"]+)"')
+        membership_status_raw = find(r'"membershipStatus"\s*:\s*"([^"]+)"') or "CURRENT_MEMBER"
+        account_status_raw = find(r'"accountStatus"\s*:\s*"([^"]+)"')
+
+        if payment_status_raw:
+            payment_status = payment_status_raw
+        elif account_status_raw in ["HOLD", "NEEDS_PAYMENT"]:
+            payment_status = "Action Required (Payment Failed)"
+        elif membership_status_raw == "CURRENT_MEMBER":
+            payment_status = "Active / Paid"
+        else:
+            payment_status = membership_status_raw
+
         extra = "Yes" if re.search(r'"showExtraMemberSection":\{"fieldType":"Boolean","value":true', txt) else "No"
         email_ver = "Yes" if re.search(r'"emailVerified"\s*:\s*true', txt) else "No"
-        ms = find(r'"membershipStatus":\s*"([^"]+)"') or "CURRENT_MEMBER"
 
         profiles: list = []
         try:
@@ -571,9 +584,10 @@ def _check_netflix_cookie(cookie_header: str, timeout_s: int = 10) -> Dict[str, 
             "has_phone": "Yes" if phone else "No",
             "video_quality": quality or "HD",
             "max_streams": streams or "2",
+            "payment_status": payment_status,
             "extra_member": extra,
             "email_verified": email_ver,
-            "membership_status": ms,
+            "membership_status": membership_status_raw,
             "profiles": profiles_str,
             "connected_profiles": str(len(profiles)) if profiles else "1"
         }
@@ -773,6 +787,7 @@ async def handle_cookie_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 f"• Member Since: {acct.get('member_since', 'Unknown')}\n"
                 f"• Next Billing: {acct.get('next_billing', 'Unknown')}\n"
                 f"• Payment: {acct.get('payment_method', 'CC')}\n"
+                f"• Payment Status: {acct.get('payment_status', 'Active / Paid')}\n"
                 f"• Phone: {acct.get('phone', 'N/A')} ({acct.get('has_phone', 'No')})\n"
                 f"• Quality: {acct.get('video_quality', 'HD')}\n"
                 f"• Streams: {acct.get('max_streams', '2')}\n"
@@ -939,6 +954,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f"• Member Since: {acct.get('member_since', 'Unknown')}\n"
                         f"• Next Billing: {acct.get('next_billing', 'Unknown')}\n"
                         f"• Payment: {acct.get('payment_method', 'CC')}\n"
+                        f"• Payment Status: {acct.get('payment_status', 'Active / Paid')}\n"
                         f"• Phone: {acct.get('phone', 'N/A')} ({acct.get('has_phone', 'No')})\n"
                         f"• Quality: {acct.get('video_quality', 'HD')}\n"
                         f"• Streams: {acct.get('max_streams', '2')}\n"
