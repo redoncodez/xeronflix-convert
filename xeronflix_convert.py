@@ -24,7 +24,7 @@ from telegram.ext import (
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8915335839:AAGRpBFdulQwjjsaKvhZ-aiEUtY7VQdjV3o")
 PORT = int(os.environ.get("PORT", 8000))
 
-# ========== FLASK BACKGROUND HEALTH CHECK SERVER ==========
+# ========== FLASK APP ==========
 app = Flask(__name__)
 
 @app.route("/")
@@ -39,13 +39,6 @@ def health():
         "bot_token_set": bool(BOT_TOKEN),
         "timestamp": time.time()
     }, 200 if application else 503
-
-def run_web_server():
-    # use_reloader=False prevents Flask from trying to bind to the port twice in background threads
-    app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
-
-# Start web server in background thread
-Thread(target=run_web_server, daemon=True).start()
 
 # ========== LOGGING SETUP ==========
 logging.basicConfig(
@@ -583,7 +576,6 @@ def run_bot_in_thread():
         application.add_handler(CommandHandler("help", help_command))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_cookie_text))
         
-        # Run polling cleanly without OS signal handlers in thread
         loop.run_until_complete(
             application.run_polling(
                 allowed_updates=Update.ALL_TYPES,
@@ -606,17 +598,19 @@ if __name__ == "__main__":
         logger.error("❌ BOT_TOKEN environment variable is not set!")
         sys.exit(1)
     
-    # Launch Telegram bot in a background thread
+    # Launch Telegram bot thread
     bot_thread = Thread(target=run_bot_in_thread, daemon=True)
     bot_thread.start()
     
-    # Give the bot thread time to initialize
-    time.sleep(3)
+    time.sleep(2)
     
-    # Keep the main process alive with Flask so background network threads don't crash
-    logger.info(f"🚀 Starting Flask server on port {PORT}\n")
+    # Try to start Flask on assigned PORT, or fallback to 8080 if PORT is temporarily busy
     try:
+        logger.info(f"🚀 Starting Flask server on port {PORT}\n")
         app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
+    except OSError as e:
+        logger.warning(f"⚠️ Port {PORT} busy ({e}), retrying on fallback port 8080...")
+        app.run(host="0.0.0.0", port=8080, debug=False, use_reloader=False)
     except (KeyboardInterrupt, SystemExit):
         logger.info("🛑 Shutting down server gracefully...")
         sys.exit(0)
