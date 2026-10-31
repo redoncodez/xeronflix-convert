@@ -583,6 +583,7 @@ def run_bot_in_thread():
         application.add_handler(CommandHandler("help", help_command))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_cookie_text))
         
+        # Run polling cleanly without OS signal handlers in thread
         loop.run_until_complete(
             application.run_polling(
                 allowed_updates=Update.ALL_TYPES,
@@ -605,8 +606,17 @@ if __name__ == "__main__":
         logger.error("❌ BOT_TOKEN environment variable is not set!")
         sys.exit(1)
     
-    # Launch Telegram bot thread
-    bot_thread = Thread(target=run_bot_in_thread, daemon=False)
+    # Launch Telegram bot in a background thread
+    bot_thread = Thread(target=run_bot_in_thread, daemon=True)
     bot_thread.start()
     
+    # Give the bot thread time to initialize
     time.sleep(3)
+    
+    # Keep the main process alive with Flask so background network threads don't crash
+    logger.info(f"🚀 Starting Flask server on port {PORT}\n")
+    try:
+        app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("🛑 Shutting down server gracefully...")
+        sys.exit(0)
