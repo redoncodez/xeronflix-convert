@@ -20,19 +20,34 @@ from telegram.ext import (
     ContextTypes,
 )
 
+# ========== CONFIGURATION ==========
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8915335839:AAGRpBFdulQwjjsaKvhZ-aiEUtY7VQdjV3o")
 PORT = int(os.environ.get("PORT", 8000))
+
+# ========== FLASK BACKGROUND HEALTH CHECK SERVER ==========
 app = Flask(__name__)
 
 @app.route("/")
 def home():
     return "Bot is running fine!", 200
 
+@app.route("/health", methods=["GET"])
+def health():
+    return {
+        "status": "healthy" if application else "unhealthy",
+        "bot_running": application is not None,
+        "bot_token_set": bool(BOT_TOKEN),
+        "timestamp": time.time()
+    }, 200 if application else 503
+
 def run_web_server():
-    app.run(host="0.0.0.0", port=PORT)
+    # use_reloader=False prevents Flask from trying to bind to the port twice in background threads
+    app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
 
 # Start web server in background thread
 Thread(target=run_web_server, daemon=True).start()
+
+# ========== LOGGING SETUP ==========
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -41,6 +56,7 @@ logger = logging.getLogger(__name__)
 
 application = None
 
+# ========== TEXT & MESSAGES ==========
 START_TEXT = (
     "👋 **Netflix Cookie Checker Bot**\n\n"
     "Paste your Netflix cookies here.\n\n"
@@ -63,8 +79,8 @@ HELP_TEXT = (
 COOKIE_KV_RE = re.compile(r"^\s*([A-Za-z0-9_\\-]+)\s*=\s*(.+?)\s*$", re.DOTALL)
 
 
+# ========== COOKIE PARSING HELPERS ==========
 def _is_json_cookie(text: str) -> bool:
-    """Check if text is JSON cookie array."""
     text = text.strip()
     if not (text.startswith('[') and text.endswith(']')):
         return False
@@ -75,7 +91,6 @@ def _is_json_cookie(text: str) -> bool:
         return False
 
 def _is_netscape_cookie(text: str) -> bool:
-    """Check if text is Netscape format cookie (tab or space delimited)."""
     lines = text.strip().split('\n')
     if len(lines) < 1:
         return False
@@ -104,14 +119,11 @@ def _is_netscape_cookie(text: str) -> bool:
                     continue
     return False
 
-
 def _looks_like_cookie_header(text: str) -> bool:
     t = text.strip().lower()
     return t.startswith("cookie:") or (";" in text and "=" in text)
 
-
 def _extract_json_cookies(json_str: str) -> Dict[str, str]:
-    """Extract cookies from JSON array format."""
     try:
         cookies_array = json.loads(json_str)
         kv: Dict[str, str] = {}
@@ -127,9 +139,7 @@ def _extract_json_cookies(json_str: str) -> Dict[str, str]:
         logger.error(f"Error parsing JSON cookies: {e}")
         return {}
 
-
 def _extract_netscape_cookies(netscape_str: str) -> Dict[str, str]:
-    """Extract cookies from Netscape format."""
     kv: Dict[str, str] = {}
     lines = netscape_str.strip().split('\n')
     
@@ -156,7 +166,6 @@ def _extract_netscape_cookies(netscape_str: str) -> Dict[str, str]:
                 continue
     return kv
 
-
 def _extract_cookie_kv_pairs(text: str) -> Dict[str, str]:
     cleaned = re.sub(r"(?i)^\s*cookie\s*:\s*", "", text).strip()
     parts = [p.strip() for p in cleaned.split(";") if p.strip()]
@@ -170,9 +179,7 @@ def _extract_cookie_kv_pairs(text: str) -> Dict[str, str]:
             kv[m.group(1).strip()] = m.group(2).strip()
     return kv
 
-
 def _build_cookie_header(cookie_input: str) -> Optional[str]:
-    """Parse any cookie format and build a cookie header string."""
     if _is_json_cookie(cookie_input):
         kv = _extract_json_cookies(cookie_input)
         if kv:
@@ -197,7 +204,6 @@ def _build_cookie_header(cookie_input: str) -> Optional[str]:
         return "; ".join([f"{k}={v}" for k, v in kv.items()])
     return None
 
-
 def _safe_preview_cookie_keys(cookie_header: str) -> str:
     names = []
     for token in cookie_header.split(";"):
@@ -208,6 +214,7 @@ def _safe_preview_cookie_keys(cookie_header: str) -> str:
     return ", ".join(names[:8]) + ("…" if len(names) > 8 else "")
 
 
+# ========== NETFLIX API & VERIFICATION ==========
 NFTOKEN_API_URL = "https://ios.prod.ftl.netflix.com/iosui/user/15.48"
 NFTOKEN_QUERY_PARAMS = {
     "appVersion": "15.48.1",
@@ -259,7 +266,6 @@ NFTOKEN_HEADERS = {
     "x-netflix.request.client.timezoneid": "Asia/Dhaka",
 }
 
-
 def _extract_netflix_id_from_cookie_header(cookie_header: str) -> Optional[str]:
     for token in cookie_header.split(";"):
         token = token.strip()
@@ -269,7 +275,6 @@ def _extract_netflix_id_from_cookie_header(cookie_header: str) -> Optional[str]:
         if k.strip().lower() == "netflixid":
             return v.strip()
     return None
-
 
 def _generate_nftoken(cookie_header: str, timeout_s: int = 20) -> Tuple[bool, str, Optional[str]]:
     netflix_id = _extract_netflix_id_from_cookie_header(cookie_header)
@@ -301,7 +306,6 @@ def _generate_nftoken(cookie_header: str, timeout_s: int = 20) -> Tuple[bool, st
         logger.error(f"Error generating nftoken: {e}")
         return False, "Invalid or expired cookie.", None
 
-
 def decode_text(value):
     if value is None:
         return "Unknown"
@@ -317,7 +321,6 @@ def decode_text(value):
         value
     )
     return value.strip()
-
 
 def _check_netflix_cookie(cookie_header: str, timeout_s: int = 25) -> Dict[str, str]:
     cookie_dict: Dict[str, str] = {}
@@ -460,19 +463,18 @@ def _check_netflix_cookie(cookie_header: str, timeout_s: int = 25) -> Dict[str, 
         return {"ok": False, "reason": str(e)}
 
 
+# ========== TELEGRAM HANDLERS ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await update.message.reply_text(START_TEXT, parse_mode="Markdown")
     except Exception as e:
         logger.error(f"Error in start: {e}")
 
-
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await update.message.reply_text(HELP_TEXT)
     except Exception as e:
         logger.error(f"Error in help: {e}")
-
 
 async def handle_cookie_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -510,7 +512,7 @@ async def handle_cookie_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
             phone_link = f"https://www.netflix.com/unsupported?nftoken={nftoken}"
             desktop_link = f"https://www.netflix.com/browse?nftoken={nftoken}"
 
-            # Formatted single-bullet account list
+            # Formatted single-bullet account list layout
             formatted_text = (
                 "📁 **Source:**\n"
                 "pasted_cookie.txt\n"
@@ -536,7 +538,7 @@ async def handle_cookie_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 f"• **Profiles:** {acct.get('profiles', 'Unknown')}"
             )
 
-            # Inline buttons for direct link logins
+            # Inline keyboard for direct link logins
             keyboard = [
                 [
                     InlineKeyboardButton("💻 PC Login", url=desktop_link),
@@ -563,6 +565,7 @@ async def handle_cookie_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
             pass
 
 
+# ========== MAIN THREAD LOOP ==========
 def run_bot_in_thread():
     global application
     
@@ -570,10 +573,11 @@ def run_bot_in_thread():
         logger.error("❌ BOT_TOKEN not set!")
         return
     
+    # Dedicated thread event loop management
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
     try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
         application = ApplicationBuilder().token(BOT_TOKEN).build()
         application.add_handler(CommandHandler("start", start))
         application.add_handler(CommandHandler("help", help_command))
@@ -586,18 +590,14 @@ def run_bot_in_thread():
             )
         )
     except Exception as e:
-        logger.error(f"❌ Bot error: {e}", exc_info=True)
+        logger.error(f"❌ Bot runtime error: {e}")
         application = None
-
-
-@app.route("/health", methods=["GET"])
-def health():
-    return {
-        "status": "healthy" if application else "unhealthy",
-        "bot_running": application is not None,
-        "bot_token_set": bool(BOT_TOKEN),
-        "timestamp": time.time()
-    }, 200 if application else 503
+    finally:
+        try:
+            loop.run_until_complete(loop.shutdown_asyncgens())
+            loop.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
@@ -605,12 +605,8 @@ if __name__ == "__main__":
         logger.error("❌ BOT_TOKEN environment variable is not set!")
         sys.exit(1)
     
+    # Launch Telegram bot thread
     bot_thread = Thread(target=run_bot_in_thread, daemon=False)
     bot_thread.start()
     
-    time.sleep(5)
-    
-    try:
-        app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False, threaded=True)
-    except KeyboardInterrupt:
-        sys.exit(0)
+    time.sleep(3)
