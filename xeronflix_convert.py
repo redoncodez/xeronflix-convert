@@ -22,6 +22,7 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
+from deep_translator import GoogleTranslator
 
 # ========== CONFIGURATION ==========
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8915335839:AAGRpBFdulQwjjsaKvhZ-aiEUtY7VQdjV3o")
@@ -536,27 +537,47 @@ def _check_netflix_cookie(cookie_header: str, timeout_s: int = 10) -> Dict[str, 
             or find(r'"maxStreams"\s*:\s*"?([0-9]+)"?')
         )
 
-        # Check explicit payment issue text in English + Spanish
+        # --- AUTO-TRANSLATION PIPELINE VIA DEEP-TRANSLATOR ---
+        translated_text = ""
+        try:
+            # Clean HTML tags briefly for text translation
+            clean_snippet = re.sub(r'<[^>]+>', ' ', txt[:3000])
+            translated_text = GoogleTranslator(source='auto', target='en').translate(clean_snippet)
+        except Exception as te:
+            logger.warning(f"GoogleTranslator auto-translation skipped: {te}")
+            translated_text = txt
+
+        # Check payment issue indicators across translated text & raw response
         has_payment_issue_text = bool(re.search(
             r"(?i)("
+            # Translated English Keywords
             r"fix\s+your\s+payment|"
             r"didn['’]t\s+go\s+through|"
             r"can['’]t\s+process\s+your\s+payment|"
+            r"could\s+not\s+process|"
+            r"unable\s+to\s+process|"
             r"retry\s+payment|"
             r"update\s+payment|"
+            r"payment\s+information|"
+            r"action\s+required|"
+            r"payment\s+method|"
+            # Raw Spanish Safeguards
             r"no\s+pudimos\s+procesar|"
             r"no\s+podemos\s+procesar|"
             r"actualiza\s+la\s+informaci[óo]n\s+de\s+pago|"
-            r"actualizar\s+forma\s+de\s+pago|"
-            r"actualizar\s+m[ée]todo\s+de\s+pago"
+            r"actualizar\s+forma\s+de\s+pago"
             r")",
-            txt
+            f"{txt} {translated_text}"
         ))
 
         payment_status_raw = find(r'"paymentStatus"\s*:\s*"([^"]+)"')
         membership_status_raw = find(r'"membershipStatus"\s*:\s*"([^"]+)"') or "CURRENT_MEMBER"
         account_status_raw = find(r'"accountStatus"\s*:\s*"([^"]+)"')
-        is_hold_json = bool(re.search(r'"(isPaymentProblem|isHold)"\s*:\s*true', txt, re.I))
+        is_hold_json = bool(re.search(
+            r'("isPaymentProblem"|"isHold"|"accountStatus"\s*:\s*"HOLD"|"billingStatus"\s*:\s*"HOLD")\s*:\s*(true|"HOLD"|"NEEDS_PAYMENT")',
+            txt,
+            re.I
+        ))
 
         if has_payment_issue_text or is_hold_json or account_status_raw in ["HOLD", "NEEDS_PAYMENT"]:
             payment_status = "Action Required (Payment Failed)"
