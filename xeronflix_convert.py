@@ -20,7 +20,7 @@ from telegram.ext import (
     ContextTypes,
 )
 
-BOT_TOKEN = os.environ.get("8915335839:AAGRpBFdulQwjjsaKvhZ-aiEUtY7VQdjV3o")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8915335839:AAGRpBFdulQwjjsaKvhZ-aiEUtY7VQdjV3o")
 PORT = int(os.environ.get("PORT", 8000))
 app = Flask(__name__)
 
