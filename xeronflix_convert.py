@@ -107,7 +107,11 @@ START_TEXT = (
     "👋 Netflix Cookie Checker Bot\n\n"
     "⚠️ IMPORTANT: You MUST set a proxy using /addproxy before checking any cookies.\n\n"
     "Available Commands:\n"
-    "• /addproxy `<http://ip:port>` — Add & test an HTTP proxy (REQUIRED)\n"
+    "• /addproxy `<proxy>` — Add & test an HTTP proxy (REQUIRED)\n"
+    "  Supported formats:\n"
+    "  - `host:port` or `http://host:port`\n"
+    "  - `user:pass@host:port` or `http://user:pass@host:port`\n"
+    "  - `user:pass:host:port` or `http://user:pass:host:port`\n"
     "• /stop — Halt an ongoing bulk check immediately\n"
     "• /help — Usage instructions\n\n"
     "Owner Commands:\n"
@@ -120,7 +124,11 @@ START_TEXT = (
 HELP_TEXT = (
     "How to use:\n"
     "1. Access is restricted. Ask owner for approval.\n"
-    "2. MANDATORY: Set a working proxy using `/addproxy http://ip:port` before checking.\n"
+    "2. MANDATORY: Set a working proxy using `/addproxy` before checking.\n"
+    "   Proxy Formats Supported:\n"
+    "   • host:port\n"
+    "   • user:pass@host:port\n"
+    "   • user:pass:host:port\n"
     "3. Paste cookies as text, upload a `.txt` file, or upload a `.zip` archive.\n"
     "4. Use `/stop` anytime to halt bulk processing."
 )
@@ -129,6 +137,22 @@ COOKIE_KV_RE = re.compile(r"^\s*([A-Za-z0-9_\\-]+)\s*=\s*(.+?)\s*$", re.DOTALL)
 
 
 # ========== HELPER FUNCTIONS FOR PROXY & PARSING ==========
+def _format_proxy_string(raw_proxy: str) -> str:
+    proxy = raw_proxy.strip()
+    scheme = "http://"
+    if proxy.startswith("http://"):
+        proxy = proxy[7:]
+    elif proxy.startswith("https://"):
+        scheme = "https://"
+        proxy = proxy[8:]
+
+    parts = proxy.split(":")
+    if len(parts) == 4:
+        user, password, host, port = parts
+        return f"{scheme}{user}:{password}@{host}:{port}"
+    
+    return f"{scheme}{proxy}"
+
 def _get_request_proxies() -> Optional[Dict[str, str]]:
     if CURRENT_PROXY:
         return {"http": CURRENT_PROXY, "https": CURRENT_PROXY}
@@ -506,7 +530,23 @@ def _check_netflix_cookie(cookie_header: str, timeout_s: int = 25) -> Dict[str, 
             or find(r'"maxStreams"\s*:\s*"?([0-9]+)"?')
         )
         
-        hold = "Yes" if re.search(r'(?i)(membership|payment|account)\s+is?\s*on\s+hold|"accountstatus":"hold"|"ishold":true', txt) else "No"
+        # Enhanced Payment Hold / Update Payment Method Detector
+        hold_patterns = r'(?i)(' \
+                        r'membership\s+is?\s*on\s+hold|' \
+                        r'payment\s+is?\s*on\s+hold|' \
+                        r'update\s+payment\s+method|' \
+                        r'update\s+your\s+payment|' \
+                        r'restart\s+your\s+membership|' \
+                        r'action\s+required\s+on\s+your\s+account|' \
+                        r'payment\s+problem|' \
+                        r'"accountStatus"\s*:\s*"HOLD"|' \
+                        r'"accountStatus"\s*:\s*"NEEDS_PAYMENT"|' \
+                        r'"billingStatus"\s*:\s*"HOLD"|' \
+                        r'"isPaymentProblem"\s*:\s*true|' \
+                        r'"isHold"\s*:\s*true' \
+                        r')'
+        hold = "Yes" if re.search(hold_patterns, txt) else "No"
+
         extra = "Yes" if re.search(r'"showExtraMemberSection":\{"fieldType":"Boolean","value":true', txt) else "No"
         email_ver = "Yes" if re.search(r'"emailVerified"\s*:\s*true', txt) else "No"
         ms = find(r'"membershipStatus":\s*"([^"]+)"') or "CURRENT_MEMBER"
@@ -641,27 +681,27 @@ async def addproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text(
             "⚠️ Please provide a proxy string.\n\n"
-            "Usage:\n"
-            "`/addproxy http://ip:port`\n"
-            "`/addproxy http://username:password@ip:port`",
+            "Supported Formats:\n"
+            "• `/addproxy host:port`\n"
+            "• `/addproxy user:pass@host:port`\n"
+            "• `/addproxy user:pass:host:port`",
             parse_mode="Markdown"
         )
         return
 
     raw_proxy = context.args[0].strip()
-    if not raw_proxy.startswith(("http://", "https://")):
-        raw_proxy = f"http://{raw_proxy}"
+    formatted_proxy = _format_proxy_string(raw_proxy)
 
     msg = await update.message.reply_text("🔄 Testing proxy connection...", parse_mode="Markdown")
     
     loop = asyncio.get_running_loop()
-    is_live, status_detail = await loop.run_in_executor(None, _is_proxy_live, raw_proxy)
+    is_live, status_detail = await loop.run_in_executor(None, _is_proxy_live, formatted_proxy)
 
     if is_live:
-        CURRENT_PROXY = raw_proxy
+        CURRENT_PROXY = formatted_proxy
         await msg.edit_text(
             f"✅ Proxy Added Successfully!\n\n"
-            f"• Proxy: `{raw_proxy}`\n"
+            f"• Proxy: `{formatted_proxy}`\n"
             f"• Status: {status_detail}",
             parse_mode="Markdown"
         )
@@ -679,11 +719,8 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"🚫 Access Denied! Your ID: `{user_id}`", parse_mode="Markdown")
         return
 
-    if not cancel_bulk_event.is_set():
-        cancel_bulk_event.set()
-        await update.message.reply_text("🛑 Stop signal sent! Halting the bulk check...")
-    else:
-        await update.message.reply_text("⚠️ No bulk operation is currently running.")
+    cancel_bulk_event.set()
+    await update.message.reply_text("🛑 Stop signal sent! Halting the bulk check...")
 
 async def handle_cookie_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -700,7 +737,7 @@ async def handle_cookie_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await update.message.reply_text(
                 "⚠️ **Proxy Required!**\n\n"
                 "You must set a live proxy before checking cookies.\n"
-                "Use `/addproxy http://ip:port` to add one.",
+                "Use `/addproxy` to set one.",
                 parse_mode="Markdown"
             )
             return
@@ -796,7 +833,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "⚠️ **Proxy Required!**\n\n"
             "You must set a live proxy before uploading files to check.\n"
-            "Use `/addproxy http://ip:port` to add one.",
+            "Use `/addproxy` to set one.",
             parse_mode="Markdown"
         )
         return
@@ -853,6 +890,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         loop = asyncio.get_running_loop()
 
         for idx, (display_name, cookie_raw) in enumerate(cookie_queue, start=1):
+            # Yield control back to event loop so /stop command can execute concurrently
+            await asyncio.sleep(0)
+
             if cancel_bulk_event.is_set():
                 logger.info("Bulk check cancelled by user via /stop")
                 break
@@ -864,6 +904,12 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     continue
 
                 ok, detail, nftoken = await loop.run_in_executor(None, _generate_nftoken, cookie_header)
+
+                # Check cancel flag again after HTTP request returns
+                if cancel_bulk_event.is_set():
+                    logger.info("Bulk check cancelled post-request via /stop")
+                    break
+
                 if ok and nftoken:
                     acct = await loop.run_in_executor(None, _check_netflix_cookie, cookie_header)
                     
@@ -950,7 +996,8 @@ def run_bot_in_thread():
         application.add_handler(CommandHandler("start", start))
         application.add_handler(CommandHandler("help", help_command))
         application.add_handler(CommandHandler("addproxy", addproxy_command))
-        application.add_handler(CommandHandler("stop", stop_command))
+        # block=False ensures /stop handler runs concurrently while handle_document is busy
+        application.add_handler(CommandHandler("stop", stop_command, block=False))
         application.add_handler(CommandHandler("approve", approve_command))
         application.add_handler(CommandHandler("disapprove", disapprove_command))
         application.add_handler(CommandHandler("approved", approved_list_command))
