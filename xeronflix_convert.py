@@ -485,6 +485,10 @@ def _check_netflix_cookie(cookie_header: str, timeout_s: int = 10) -> Dict[str, 
         if not resp or resp.status_code != 200:
             return {"ok": False, "reason": f"HTTP {resp.status_code if resp else 'error'}"}
 
+        # --- ADD THESE 2 DEBUG LINES ---
+        logger.info(f"🔍 DEBUG Page Title: {re.findall(r'<title>(.*?)</title>', txt)}")
+        logger.info(f"🔍 DEBUG HTML Excerpt: {txt[:500]}...")
+        # -------------------------------
         if ("login" in (resp.url or "").lower()) or ("signin" in (resp.url or "").lower()):
             return {"ok": False, "reason": "Redirected to login"}
 
