@@ -481,7 +481,7 @@ def _check_netflix_cookie(cookie_header: str, timeout_s: int = 10) -> Dict[str, 
         for url in urls:
             try:
                 r = session.get(url, headers=headers, timeout=timeout_s, allow_redirects=True, verify=False)
-                if r.status_code == 200 and ("Account" in (r.text or "") or "YourAccount" in r.url):
+                if r.status_code == 200 and ("Account" in (r.text or "") or "YourAccount" in r.url or "cuenta" in (r.text or "").lower()):
                     resp = r
                     txt = r.text or ""
                     break
@@ -536,15 +536,32 @@ def _check_netflix_cookie(cookie_header: str, timeout_s: int = 10) -> Dict[str, 
             or find(r'"maxStreams"\s*:\s*"?([0-9]+)"?')
         )
 
-        # Parse Explicit Payment & Account Status directly from internal state
+        # Check explicit payment issue text in English + Spanish
+        has_payment_issue_text = bool(re.search(
+            r"(?i)("
+            r"fix\s+your\s+payment|"
+            r"didn['’]t\s+go\s+through|"
+            r"can['’]t\s+process\s+your\s+payment|"
+            r"retry\s+payment|"
+            r"update\s+payment|"
+            r"no\s+pudimos\s+procesar|"
+            r"no\s+podemos\s+procesar|"
+            r"actualiza\s+la\s+informaci[óo]n\s+de\s+pago|"
+            r"actualizar\s+forma\s+de\s+pago|"
+            r"actualizar\s+m[ée]todo\s+de\s+pago"
+            r")",
+            txt
+        ))
+
         payment_status_raw = find(r'"paymentStatus"\s*:\s*"([^"]+)"')
         membership_status_raw = find(r'"membershipStatus"\s*:\s*"([^"]+)"') or "CURRENT_MEMBER"
         account_status_raw = find(r'"accountStatus"\s*:\s*"([^"]+)"')
+        is_hold_json = bool(re.search(r'"(isPaymentProblem|isHold)"\s*:\s*true', txt, re.I))
 
-        if payment_status_raw:
-            payment_status = payment_status_raw
-        elif account_status_raw in ["HOLD", "NEEDS_PAYMENT"]:
+        if has_payment_issue_text or is_hold_json or account_status_raw in ["HOLD", "NEEDS_PAYMENT"]:
             payment_status = "Action Required (Payment Failed)"
+        elif payment_status_raw:
+            payment_status = payment_status_raw
         elif membership_status_raw == "CURRENT_MEMBER":
             payment_status = "Active / Paid"
         else:
