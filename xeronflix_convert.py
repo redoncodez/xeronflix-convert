@@ -531,20 +531,22 @@ def _check_netflix_cookie(cookie_header: str, timeout_s: int = 25) -> Dict[str, 
         )
         
         # Enhanced Payment Hold / Update Payment Method Detector
-        hold_patterns = r'(?i)(' \
-                        r'membership\s+is?\s*on\s+hold|' \
-                        r'payment\s+is?\s*on\s+hold|' \
-                        r'update\s+payment\s+method|' \
-                        r'update\s+your\s+payment|' \
-                        r'restart\s+your\s+membership|' \
-                        r'action\s+required\s+on\s+your\s+account|' \
-                        r'payment\s+problem|' \
-                        r'"accountStatus"\s*:\s*"HOLD"|' \
-                        r'"accountStatus"\s*:\s*"NEEDS_PAYMENT"|' \
-                        r'"billingStatus"\s*:\s*"HOLD"|' \
-                        r'"isPaymentProblem"\s*:\s*true|' \
-                        r'"isHold"\s*:\s*true' \
-                        r')'
+        hold_patterns = (
+            r"(?i)("
+            r"membership\s+is?\s*on\s+hold|"
+            r"payment\s+is?\s*on\s+hold|"
+            r"update\s+payment\s+method|"
+            r"update\s+your\s+payment|"
+            r"restart\s+your\s+membership|"
+            r"action\s+required|"
+            r"payment\s+problem|"
+            r'accountstatus["\s:]+hold|'
+            r'accountstatus["\s:]+needs_payment|'
+            r'billingstatus["\s:]+hold|'
+            r'ispaymentproblem["\s:]+true|'
+            r'ishold["\s:]+true'
+            r")"
+        )
         hold = "Yes" if re.search(hold_patterns, txt) else "No"
 
         extra = "Yes" if re.search(r'"showExtraMemberSection":\{"fieldType":"Boolean","value":true', txt) else "No"
