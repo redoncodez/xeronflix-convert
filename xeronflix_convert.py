@@ -24,30 +24,30 @@ from telegram.ext import (
 )
 
 # ========== CONFIGURATION ==========
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8915335839:AAGRpBFdulQwjjsaKvhZ-aiEUtY7VQdjV3o")
-PORT = int(os.environ.get("PORT", 8000))
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8915335839:AAGRpBFdulQwjjsaKvhZ-aiEUtY7VQdjV3o")[cite: 3]
+PORT = int(os.environ.get("PORT", 8000))[cite: 3]
 
 # SET YOUR TELEGRAM USER ID HERE (Owner Has Permanent Access)
-OWNER_ID = int(os.environ.get("OWNER_ID", 6420446828))
+OWNER_ID = int(os.environ.get("OWNER_ID", 6420446828))[cite: 3]
 
 # Set to store approved User IDs (Owner is automatically added)
-APPROVED_USERS: Set[int] = {OWNER_ID}
+APPROVED_USERS: Set[int] = {OWNER_ID}[cite: 3]
 
 # Global proxy state and bulk cancel event
-CURRENT_PROXY: Optional[str] = None
-cancel_bulk_event = asyncio.Event()
+CURRENT_PROXY: Optional[str] = None[cite: 3]
+cancel_bulk_event = asyncio.Event()[cite: 3]
 
 # ========== ACCESS CONTROL HELPER ==========
 def is_approved(user_id: int) -> bool:
-    return user_id in APPROVED_USERS or user_id == OWNER_ID
+    return user_id in APPROVED_USERS or user_id == OWNER_ID[cite: 3]
 
 # ========== FLASK APP & HEALTH ENDPOINTS ==========
-app = Flask(__name__)
+app = Flask(__name__)[cite: 3]
 
 @app.route("/", methods=["GET"])
 def index():
-    bot_status = "🟢 Running" if application else "🔴 Stopped"
-    proxy_status = CURRENT_PROXY if CURRENT_PROXY else "❌ Not Set (Required)"
+    bot_status = "🟢 Running" if application else "🔴 Stopped"[cite: 3]
+    proxy_status = CURRENT_PROXY if CURRENT_PROXY else "❌ Not Set (Required)"[cite: 3]
     return f"""
     <html>
         <head>
@@ -79,7 +79,7 @@ def index():
             </div>
         </body>
     </html>
-    """, 200
+    """, 200[cite: 3]
 
 @app.route("/health", methods=["GET"])
 def health():
@@ -91,16 +91,16 @@ def health():
         "proxy_set": bool(CURRENT_PROXY),
         "current_proxy": CURRENT_PROXY,
         "timestamp": time.time()
-    }, 200 if application else 503
+    }, 200 if application else 503[cite: 3]
 
 # ========== LOGGING SETUP ==========
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
+)[cite: 3]
+logger = logging.getLogger(__name__)[cite: 3]
 
-application = None
+application = None[cite: 3]
 
 # ========== MESSAGES & TEXT ==========
 START_TEXT = (
@@ -119,7 +119,7 @@ START_TEXT = (
     "• /disapprove `<userid>` — Revoke access from a user\n"
     "• /approved — View list of approved users\n\n"
     " Bot by @zyokr 🦖"
-)
+)[cite: 3]
 
 HELP_TEXT = (
     "How to use:\n"
@@ -131,203 +131,203 @@ HELP_TEXT = (
     "   • user:pass:host:port\n"
     "3. Paste cookies as text, upload a `.txt` file, or upload a `.zip` archive.\n"
     "4. Use `/stop` anytime to halt bulk processing."
-)
+)[cite: 3]
 
-COOKIE_KV_RE = re.compile(r"^\s*([A-Za-z0-9_\\-]+)\s*=\s*(.+?)\s*$", re.DOTALL)
+COOKIE_KV_RE = re.compile(r"^\s*([A-Za-z0-9_\\-]+)\s*=\s*(.+?)\s*$", re.DOTALL)[cite: 3]
 
 
 # ========== HELPER FUNCTIONS FOR PROXY & PARSING ==========
 def _format_proxy_string(raw_proxy: str) -> str:
-    proxy = raw_proxy.strip()
-    scheme = "http://"
+    proxy = raw_proxy.strip()[cite: 3]
+    scheme = "http://"[cite: 3]
     if proxy.startswith("http://"):
-        proxy = proxy[7:]
+        proxy = proxy[7:][cite: 3]
     elif proxy.startswith("https://"):
-        scheme = "https://"
-        proxy = proxy[8:]
+        scheme = "https://"[cite: 3]
+        proxy = proxy[8:][cite: 3]
 
-    parts = proxy.split(":")
+    parts = proxy.split(":")[cite: 3]
     if len(parts) == 4:
-        user, password, host, port = parts
-        return f"{scheme}{user}:{password}@{host}:{port}"
+        user, password, host, port = parts[cite: 3]
+        return f"{scheme}{user}:{password}@{host}:{port}"[cite: 3]
     
-    return f"{scheme}{proxy}"
+    return f"{scheme}{proxy}"[cite: 3]
 
 def _get_request_proxies() -> Optional[Dict[str, str]]:
     if CURRENT_PROXY:
-        return {"http": CURRENT_PROXY, "https": CURRENT_PROXY}
-    return None
+        return {"http": CURRENT_PROXY, "https": CURRENT_PROXY}[cite: 3]
+    return None[cite: 3]
 
 def _is_proxy_live(proxy_str: str) -> Tuple[bool, str]:
-    proxies = {"http": proxy_str, "https": proxy_str}
+    proxies = {"http": proxy_str, "https": proxy_str}[cite: 3]
     try:
-        r = requests.get("https://httpbin.org/ip", proxies=proxies, timeout=6, verify=False)
+        r = requests.get("https://httpbin.org/ip", proxies=proxies, timeout=6, verify=False)[cite: 3]
         if r.status_code == 200:
-            ip = r.json().get("origin", "Unknown IP")
-            return True, f"Live! Outbound IP: `{ip}`"
-        return False, f"Failed with status code {r.status_code}"
+            ip = r.json().get("origin", "Unknown IP")[cite: 3]
+            return True, f"Live! Outbound IP: `{ip}`"[cite: 3]
+        return False, f"Failed with status code {r.status_code}"[cite: 3]
     except Exception as e:
-        return False, str(e)
+        return False, str(e)[cite: 3]
 
 def _is_json_cookie(text: str) -> bool:
-    text = text.strip()
+    text = text.strip()[cite: 3]
     if not (text.startswith('[') and text.endswith(']')):
-        return False
+        return False[cite: 3]
     try:
-        json.loads(text)
-        return True
+        json.loads(text)[cite: 3]
+        return True[cite: 3]
     except Exception:
-        return False
+        return False[cite: 3]
 
 def _is_netscape_cookie(text: str) -> bool:
-    lines = text.strip().split('\n')
+    lines = text.strip().split('\n')[cite: 3]
     if len(lines) < 1:
-        return False
+        return False[cite: 3]
     
     for line in lines:
-        line = line.strip()
+        line = line.strip()[cite: 3]
         if not line or line.startswith('#'):
-            continue
+            continue[cite: 3]
         
         if '\t' in line:
-            parts = line.split('\t')
+            parts = line.split('\t')[cite: 3]
             if len(parts) >= 7:
-                return True
+                return True[cite: 3]
         else:
-            parts = line.split()
+            parts = line.split()[cite: 3]
             if len(parts) >= 7:
-                domain = parts[0]
-                flag = parts[1]
-                path = parts[2]
-                secure = parts[3]
+                domain = parts[0][cite: 3]
+                flag = parts[1][cite: 3]
+                path = parts[2][cite: 3]
+                secure = parts[3][cite: 3]
                 try:
-                    _ = int(parts[4])
+                    _ = int(parts[4])[cite: 3]
                     if domain.startswith('.') and flag in ['TRUE', 'FALSE'] and path == '/' and secure in ['TRUE', 'FALSE']:
-                        return True
+                        return True[cite: 3]
                 except (ValueError, IndexError):
-                    continue
-    return False
+                    continue[cite: 3]
+    return False[cite: 3]
 
 def _looks_like_cookie_header(text: str) -> bool:
-    t = text.strip().lower()
-    return t.startswith("cookie:") or (";" in text and "=" in text)
+    t = text.strip().lower()[cite: 3]
+    return t.startswith("cookie:") or (";" in text and "=" in text)[cite: 3]
 
 def _extract_json_cookies(json_str: str) -> Dict[str, str]:
     try:
-        cookies_array = json.loads(json_str)
-        kv: Dict[str, str] = {}
+        cookies_array = json.loads(json_str)[cite: 3]
+        kv: Dict[str, str] = {}[cite: 3]
         if isinstance(cookies_array, list):
             for cookie_obj in cookies_array:
                 if isinstance(cookie_obj, dict):
-                    name = cookie_obj.get('name', '')
-                    value = cookie_obj.get('value', '')
+                    name = cookie_obj.get('name', '')[cite: 3]
+                    value = cookie_obj.get('value', '')[cite: 3]
                     if name and value:
-                        kv[name] = value
-        return kv
+                        kv[name] = value[cite: 3]
+        return kv[cite: 3]
     except Exception as e:
-        logger.error(f"Error parsing JSON cookies: {e}")
-        return {}
+        logger.error(f"Error parsing JSON cookies: {e}")[cite: 3]
+        return {}[cite: 3]
 
 def _extract_netscape_cookies(netscape_str: str) -> Dict[str, str]:
-    kv: Dict[str, str] = {}
-    lines = netscape_str.strip().split('\n')
+    kv: Dict[str, str] = {}[cite: 3]
+    lines = netscape_str.strip().split('\n')[cite: 3]
     
     for line in lines:
-        line = line.strip()
+        line = line.strip()[cite: 3]
         if not line or line.startswith('#'):
-            continue
+            continue[cite: 3]
         
-        delimiter = '\t' if '\t' in line else ' '
-        parts = line.split(delimiter)
+        delimiter = '\t' if '\t' in line else ' '[cite: 3]
+        parts = line.split(delimiter)[cite: 3]
         
         if len(parts) >= 7:
             try:
-                name = parts[5]
+                name = parts[5][cite: 3]
                 if delimiter == '\t':
-                    value = parts[6]
+                    value = parts[6][cite: 3]
                 else:
-                    match = re.match(r'^(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(.+)$', line)
-                    value = match.group(7).strip() if match else ' '.join(parts[6:])
+                    match = re.match(r'^(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(.+)$', line)[cite: 3]
+                    value = match.group(7).strip() if match else ' '.join(parts[6:])[cite: 3]
                 
                 if name and value:
-                    kv[name] = value
+                    kv[name] = value[cite: 3]
             except Exception:
-                continue
-    return kv
+                continue[cite: 3]
+    return kv[cite: 3]
 
 def _extract_cookie_kv_pairs(text: str) -> Dict[str, str]:
-    cleaned = re.sub(r"(?i)^\s*cookie\s*:\s*", "", text).strip()
-    parts = [p.strip() for p in cleaned.split(";") if p.strip()]
+    cleaned = re.sub(r"(?i)^\s*cookie\s*:\s*", "", text).strip()[cite: 3]
+    parts = [p.strip() for p in cleaned.split(";") if p.strip()][cite: 3]
     if len(parts) == 1 and "\n" in cleaned:
-        parts = [p.strip() for p in cleaned.splitlines() if p.strip()]
+        parts = [p.strip() for p in cleaned.splitlines() if p.strip()][cite: 3]
 
-    kv: Dict[str, str] = {}
+    kv: Dict[str, str] = {}[cite: 3]
     for part in parts:
-        m = COOKIE_KV_RE.match(part)
+        m = COOKIE_KV_RE.match(part)[cite: 3]
         if m:
-            kv[m.group(1).strip()] = m.group(2).strip()
-    return kv
+            kv[m.group(1).strip()] = m.group(2).strip()[cite: 3]
+    return kv[cite: 3]
 
 def _build_cookie_header(cookie_input: str) -> Optional[str]:
     if _is_json_cookie(cookie_input):
-        kv = _extract_json_cookies(cookie_input)
+        kv = _extract_json_cookies(cookie_input)[cite: 3]
         if kv:
-            return "; ".join([f"{k}={v}" for k, v in kv.items()])
+            return "; ".join([f"{k}={v}" for k, v in kv.items()])[cite: 3]
     
     if _is_netscape_cookie(cookie_input):
-        kv = _extract_netscape_cookies(cookie_input)
+        kv = _extract_netscape_cookies(cookie_input)[cite: 3]
         if kv:
-            return "; ".join([f"{k}={v}" for k, v in kv.items()])
+            return "; ".join([f"{k}={v}" for k, v in kv.items()])[cite: 3]
     
     if _looks_like_cookie_header(cookie_input):
-        cleaned = re.sub(r"(?i)^\s*cookie\s*:\s*", "", cookie_input).strip()
+        cleaned = re.sub(r"(?i)^\s*cookie\s*:\s*", "", cookie_input).strip()[cite: 3]
         if "=" not in cleaned:
-            return None
-        kv = _extract_cookie_kv_pairs(cookie_input)
+            return None[cite: 3]
+        kv = _extract_cookie_kv_pairs(cookie_input)[cite: 3]
         if kv:
-            return "; ".join([f"{k}={v}" for k, v in kv.items()])
-        return cleaned
+            return "; ".join([f"{k}={v}" for k, v in kv.items()])[cite: 3]
+        return cleaned[cite: 3]
 
-    kv = _extract_cookie_kv_pairs(cookie_input)
+    kv = _extract_cookie_kv_pairs(cookie_input)[cite: 3]
     if kv:
-        return "; ".join([f"{k}={v}" for k, v in kv.items()])
-    return None
+        return "; ".join([f"{k}={v}" for k, v in kv.items()])[cite: 3]
+    return None[cite: 3]
 
 def _split_multiple_cookies(text: str) -> list[str]:
-    text = text.strip()
+    text = text.strip()[cite: 3]
     if _is_json_cookie(text):
-        return [text]
+        return [text][cite: 3]
     
-    blocks = re.split(r'\n\s*\n', text)
-    cookie_list = []
+    blocks = re.split(r'\n\s*\n', text)[cite: 3]
+    cookie_list = [][cite: 3]
     
     for block in blocks:
-        block = block.strip()
+        block = block.strip()[cite: 3]
         if not block:
-            continue
-        lines = block.splitlines()
+            continue[cite: 3]
+        lines = block.splitlines()[cite: 3]
         if any("netflixid" in line.lower() for line in lines):
-            cookie_list.append(block)
+            cookie_list.append(block)[cite: 3]
         else:
             for line in lines:
-                line = line.strip()
+                line = line.strip()[cite: 3]
                 if "netflixid" in line.lower():
-                    cookie_list.append(line)
+                    cookie_list.append(line)[cite: 3]
                     
-    return cookie_list if cookie_list else [text]
+    return cookie_list if cookie_list else [text][cite: 3]
 
 def _safe_preview_cookie_keys(cookie_header: str) -> str:
-    names = []
+    names = [][cite: 3]
     for token in cookie_header.split(";"):
-        token = token.strip()
+        token = token.strip()[cite: 3]
         if "=" in token:
-            names.append(token.split("=", 1)[0].strip())
-    names = [n for n in names if n]
-    return ", ".join(names[:8]) + ("…" if len(names) > 8 else "")
+            names.append(token.split("=", 1)[0].strip())[cite: 3]
+    names = [n for n in names if n][cite: 3]
+    return ", ".join(names[:8]) + ("…" if len(names) > 8 else "")[cite: 3]
 
 
 # ========== NETFLIX API & VERIFICATION ==========
-NFTOKEN_API_URL = "https://ios.prod.ftl.netflix.com/iosui/user/15.48"
+NFTOKEN_API_URL = "https://ios.prod.ftl.netflix.com/iosui/user/15.48"[cite: 3]
 NFTOKEN_QUERY_PARAMS = {
     "appVersion": "15.48.1",
     "config": '{"gamesInTrailersEnabled":"false","isTrailersEvidenceEnabled":"false","cdsMyListSortEnabled":"true","kidsBillboardEnabled":"true","addHorizontalBoxArtToVideoSummariesEnabled":"false","skOverlayTestEnabled":"false","homeFeedTestTVMovieListsEnabled":"false","baselineOnIpadEnabled":"true","trailersVideoIdLoggingFixEnabled":"true","postPlayPreviewsEnabled":"false","bypassContextualAssetsEnabled":"false","roarEnabled":"false","useSeason1AltLabelEnabled":"false","disableCDSSearchPaginationSectionKinds":["searchVideoCarousel"],"cdsSearchHorizontalPaginationEnabled":"true","searchPreQueryGamesEnabled":"true","kidsMyListEnabled":"true","billboardEnabled":"true","useCDSGalleryEnabled":"true","contentWarningEnabled":"true","videosInPopularGamesEnabled":"true","avifFormatEnabled":"false","sharksEnabled":"true"}',
@@ -347,7 +347,7 @@ NFTOKEN_QUERY_PARAMS = {
     "pixelDensity": "2.0",
     "progressive": "false",
     "responseFormat": "json",
-}
+}[cite: 3]
 
 NFTOKEN_HEADERS = {
     "User-Agent": "Argo/15.48.1 (iPhone; iOS 15.8.5; Scale/2.00)",
@@ -376,25 +376,25 @@ NFTOKEN_HEADERS = {
     "x-netflix.context.pixel-density": "2.0",
     "x-netflix.request.toplevel.uuid": "90AFE39F-ADF1-4D8A-B33E-528730990FE3",
     "x-netflix.request.client.timezoneid": "Asia/Dhaka",
-}
+}[cite: 3]
 
 def _extract_netflix_id_from_cookie_header(cookie_header: str) -> Optional[str]:
     for token in cookie_header.split(";"):
-        token = token.strip()
+        token = token.strip()[cite: 3]
         if not token or "=" not in token:
-            continue
-        k, v = token.split("=", 1)
+            continue[cite: 3]
+        k, v = token.split("=", 1)[cite: 3]
         if k.strip().lower() == "netflixid":
-            return v.strip()
-    return None
+            return v.strip()[cite: 3]
+    return None[cite: 3]
 
 def _generate_nftoken(cookie_header: str, timeout_s: int = 8) -> Tuple[bool, str, Optional[str]]:
-    netflix_id = _extract_netflix_id_from_cookie_header(cookie_header)
+    netflix_id = _extract_netflix_id_from_cookie_header(cookie_header)[cite: 3]
     if not netflix_id:
-        return False, "Invalid or expired cookie. NetflixId not found.", None
+        return False, "Invalid or expired cookie. NetflixId not found.", None[cite: 3]
 
-    headers = dict(NFTOKEN_HEADERS)
-    headers["Cookie"] = f"NetflixId={netflix_id}"
+    headers = dict(NFTOKEN_HEADERS)[cite: 3]
+    headers["Cookie"] = f"NetflixId={netflix_id}"[cite: 3]
 
     try:
         r = requests.get(
@@ -404,58 +404,58 @@ def _generate_nftoken(cookie_header: str, timeout_s: int = 8) -> Tuple[bool, str
             proxies=_get_request_proxies(),
             timeout=timeout_s,
             verify=False,
-        )
-        r.raise_for_status()
-        data = r.json()
+        )[cite: 3]
+        r.raise_for_status()[cite: 3]
+        data = r.json()[cite: 3]
 
-        td = ((((data.get("value") or {}).get("account") or {}).get("token") or {}).get("default") or {})
-        nftoken = td.get("token")
+        td = ((((data.get("value") or {}).get("account") or {}).get("token") or {}).get("default") or {})[cite: 3]
+        nftoken = td.get("token")[cite: 3]
 
         if not nftoken:
-            return False, "Invalid or expired cookie. Token generation failed.", None
+            return False, "Invalid or expired cookie. Token generation failed.", None[cite: 3]
 
-        return True, "Token API returned a valid nftoken.", nftoken
+        return True, "Token API returned a valid nftoken.", nftoken[cite: 3]
     except Exception as e:
-        logger.error(f"Error generating nftoken: {e}")
-        return False, "Invalid or expired cookie.", None
+        logger.error(f"Error generating nftoken: {e}")[cite: 3]
+        return False, "Invalid or expired cookie.", None[cite: 3]
 
 def decode_text(value):
     if value is None:
-        return "Unknown"
-    value = str(value)
+        return "Unknown"[cite: 3]
+    value = str(value)[cite: 3]
     try:
-        value = codecs.decode(value, "unicode_escape")
+        value = codecs.decode(value, "unicode_escape")[cite: 3]
     except Exception:
-        pass
-    value = html.unescape(value)
+        pass[cite: 3]
+    value = html.unescape(value)[cite: 3]
     value = re.sub(
         r'\\x([0-9A-Fa-f]{2})',
         lambda m: bytes.fromhex(m.group(1)).decode('latin1'),
         value
-    )
-    return value.strip()
+    )[cite: 3]
+    return value.strip()[cite: 3]
 
 def _check_netflix_cookie(cookie_header: str, timeout_s: int = 10) -> Dict[str, str]:
-    cookie_dict: Dict[str, str] = {}
+    cookie_dict: Dict[str, str] = {}[cite: 3]
     for token in cookie_header.split(";"):
-        token = token.strip()
+        token = token.strip()[cite: 3]
         if not token or "=" not in token:
-            continue
-        k, v = token.split("=", 1)
-        cookie_dict[k.strip()] = v.strip()
+            continue[cite: 3]
+        k, v = token.split("=", 1)[cite: 3]
+        cookie_dict[k.strip()] = v.strip()[cite: 3]
 
     if not cookie_dict.get("NetflixId"):
-        return {"ok": False, "reason": "No NetflixId found in cookies"}
+        return {"ok": False, "reason": "No NetflixId found in cookies"}[cite: 3]
 
-    session = requests.Session()
-    session.cookies.update(cookie_dict)
+    session = requests.Session()[cite: 3]
+    session.cookies.update(cookie_dict)[cite: 3]
     
     # Enforce English language cookies
-    session.cookies.set("nf_lang", "en", domain=".netflix.com")
-    session.cookies.set("cl_lang", "en-US", domain=".netflix.com")
+    session.cookies.set("nf_lang", "en", domain=".netflix.com")[cite: 3]
+    session.cookies.set("cl_lang", "en-US", domain=".netflix.com")[cite: 3]
     
     if CURRENT_PROXY:
-        session.proxies.update(_get_request_proxies())
+        session.proxies.update(_get_request_proxies())[cite: 3]
 
     headers = {
         "User-Agent": (
@@ -467,74 +467,74 @@ def _check_netflix_cookie(cookie_header: str, timeout_s: int = 10) -> Dict[str, 
         "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, deflate",
         "X-Netflix.Context.Locales": "en-US",
-    }
+    }[cite: 3]
 
     urls = [
         "https://www.netflix.com/YourAccount?locale=en-US",
         "https://www.netflix.com/account?locale=en-US",
         "https://www.netflix.com/account/membership?locale=en-US",
-    ]
+    ][cite: 3]
 
     try:
-        resp = None
-        txt = ""
+        resp = None[cite: 3]
+        txt = ""[cite: 3]
         for url in urls:
             try:
-                r = session.get(url, headers=headers, timeout=timeout_s, allow_redirects=True, verify=False)
+                r = session.get(url, headers=headers, timeout=timeout_s, allow_redirects=True, verify=False)[cite: 3]
                 if r.status_code == 200 and ("Account" in (r.text or "") or "YourAccount" in r.url or "cuenta" in (r.text or "").lower()):
-                    resp = r
-                    txt = r.text or ""
-                    break
+                    resp = r[cite: 3]
+                    txt = r.text or ""[cite: 3]
+                    break[cite: 3]
             except Exception:
-                continue
+                continue[cite: 3]
 
         if not resp or resp.status_code != 200:
-            return {"ok": False, "reason": f"HTTP {resp.status_code if resp else 'error'}"}
+            return {"ok": False, "reason": f"HTTP {resp.status_code if resp else 'error'}"}[cite: 3]
 
         if ("login" in (resp.url or "").lower()) or ("signin" in (resp.url or "").lower()):
-            return {"ok": False, "reason": "Redirected to login"}
+            return {"ok": False, "reason": "Redirected to login"}[cite: 3]
 
         def find(pattern: str) -> Optional[str]:
-            m = re.search(pattern, txt)
-            return decode_text(m.group(1)) if m else None
+            m = re.search(pattern, txt)[cite: 3]
+            return decode_text(m.group(1)) if m else None[cite: 3]
 
-        name = find(r'"accountOwnerName"\s*:\s*"([^"]+)"') or find(r'"firstName"\s*:\s*"([^"]+)"')
-        plan_raw = find(r'localizedPlanName.{1,50}?value":"([^"]+)"') or find(r'"planName"\s*:\s*"([^"]+)"')
+        name = find(r'"accountOwnerName"\s*:\s*"([^"]+)"') or find(r'"firstName"\s*:\s*"([^"]+)"')[cite: 3]
+        plan_raw = find(r'localizedPlanName.{1,50}?value":"([^"]+)"') or find(r'"planName"\s*:\s*"([^"]+)"')[cite: 3]
         country = (
             find(r'"countryOfSignup"\s*:\s*"([^"]+)"')
             or find(r'"countryCode"\s*:\s*"([^"]+)"')
             or find(r'"currentCountry"\s*:\s*"([^"]+)"')
-        )
+        )[cite: 3]
         email = (
             find(r'"emailAddress"\s*:\s*"([^"]+)"')
             or find(r'"email"\s*:\s*"([^"]+)"')
             or find(r'"loginId"\s*:\s*"([^"]+)"')
-        )
-        member_since = find(r'"memberSince":"([^"]+)"')
+        )[cite: 3]
+        member_since = find(r'"memberSince":"([^"]+)"')[cite: 3]
         next_billing = (
             find(r'"nextBillingDate":\{[^}]*"date":"([^T"]+)"')
             or find(r'"nextBilling"[^}]*"value":"([^"]+)"')
-        )
+        )[cite: 3]
         plan_price = (
             find(r'"planPrice":\{"fieldType":"String","value":"([^"]+)"')
             or find(r'"formattedPlanPrice"\s*:\s*"([^"]+)"')
-        )
+        )[cite: 3]
         payment = (
             find(r'"paymentMethod":\{"fieldType":"String","value":"([^"]+)"')
             or find(r'"paymentMethodType"\s*:\s*"([^"]+)"')
-        )
+        )[cite: 3]
         phone = (
             find(r'"phoneNumberDigits":\{[^}]*"value":"([^"]+)"')
             or find(r'"phoneNumber"\s*:\s*"([^"]+)"')
-        )
+        )[cite: 3]
         quality = (
             find(r'"videoQuality":\{"fieldType":"String","value":"([^"]+)"')
             or find(r'"maxVideoQuality"\s*:\s*"([^"]+)"')
-        )
+        )[cite: 3]
         streams = (
             find(r'"maxStreams":\{"fieldType":"Numeric","value":([0-9]+)')
             or find(r'"maxStreams"\s*:\s*"?([0-9]+)"?')
-        )
+        )[cite: 3]
 
         # Check explicit payment issue text in English + Spanish
         has_payment_issue_text = bool(re.search(
@@ -551,41 +551,41 @@ def _check_netflix_cookie(cookie_header: str, timeout_s: int = 10) -> Dict[str, 
             r"actualizar\s+m[ée]todo\s+de\s+pago"
             r")",
             txt
-        ))
+        ))[cite: 3]
 
-        payment_status_raw = find(r'"paymentStatus"\s*:\s*"([^"]+)"')
-        membership_status_raw = find(r'"membershipStatus"\s*:\s*"([^"]+)"') or "CURRENT_MEMBER"
-        account_status_raw = find(r'"accountStatus"\s*:\s*"([^"]+)"')
-        is_hold_json = bool(re.search(r'"(isPaymentProblem|isHold)"\s*:\s*true', txt, re.I))
+        payment_status_raw = find(r'"paymentStatus"\s*:\s*"([^"]+)"')[cite: 3]
+        membership_status_raw = find(r'"membershipStatus"\s*:\s*"([^"]+)"') or "CURRENT_MEMBER"[cite: 3]
+        account_status_raw = find(r'"accountStatus"\s*:\s*"([^"]+)"')[cite: 3]
+        is_hold_json = bool(re.search(r'"(isPaymentProblem|isHold)"\s*:\s*true', txt, re.I))[cite: 3]
 
         if has_payment_issue_text or is_hold_json or account_status_raw in ["HOLD", "NEEDS_PAYMENT"]:
-            payment_status = "Action Required (Payment Failed)"
+            payment_status = "Action Required (Payment Failed)"[cite: 3]
         elif payment_status_raw:
-            payment_status = payment_status_raw
+            payment_status = payment_status_raw[cite: 3]
         elif membership_status_raw == "CURRENT_MEMBER":
-            payment_status = "Active / Paid"
+            payment_status = "Active / Paid"[cite: 3]
         else:
-            payment_status = membership_status_raw
+            payment_status = membership_status_raw[cite: 3]
 
-        extra = "Yes" if re.search(r'"showExtraMemberSection":\{"fieldType":"Boolean","value":true', txt) else "No"
-        email_ver = "Yes" if re.search(r'"emailVerified"\s*:\s*true', txt) else "No"
+        extra = "Yes" if re.search(r'"showExtraMemberSection":\{"fieldType":"Boolean","value":true', txt) else "No"[cite: 3]
+        email_ver = "Yes" if re.search(r'"emailVerified"\s*:\s*true', txt) else "No"[cite: 3]
 
-        profiles: list = []
+        profiles: list = [][cite: 3]
         try:
-            rp = session.get("https://www.netflix.com/ManageProfiles?locale=en-US", timeout=6, verify=False)
+            rp = session.get("https://www.netflix.com/ManageProfiles?locale=en-US", timeout=6, verify=False)[cite: 3]
             if rp.status_code == 200:
-                profiles = re.findall(r'"profileName"\s*:\s*"([^"]+)"', rp.text or "")
+                profiles = re.findall(r'"profileName"\s*:\s*"([^"]+)"', rp.text or "")[cite: 3]
                 if not profiles:
-                    profiles = re.findall(r'"displayName"\s*:\s*"([^"]+)"', rp.text or "")
+                    profiles = re.findall(r'"displayName"\s*:\s*"([^"]+)"', rp.text or "")[cite: 3]
                 if not profiles:
-                    profiles = re.findall(r'"name"\s*:\s*"([^"]+)"', rp.text or "")
+                    profiles = re.findall(r'"name"\s*:\s*"([^"]+)"', rp.text or "")[cite: 3]
         except Exception:
-            pass
+            pass[cite: 3]
 
         profiles_str = (
             ", ".join(decode_text(p) for p in profiles)
             if profiles else (name or "Unknown")
-        )
+        )[cite: 3]
 
         return {
             "ok": True,
@@ -607,96 +607,96 @@ def _check_netflix_cookie(cookie_header: str, timeout_s: int = 10) -> Dict[str, 
             "membership_status": membership_status_raw,
             "profiles": profiles_str,
             "connected_profiles": str(len(profiles)) if profiles else "1"
-        }
+        }[cite: 3]
     except Exception as e:
-        logger.error(f"Error checking netflix cookie: {e}")
-        return {"ok": False, "reason": str(e)}
+        logger.error(f"Error checking netflix cookie: {e}")[cite: 3]
+        return {"ok": False, "reason": str(e)}[cite: 3]
 
 
 # ========== OWNER APPROVAL SYSTEM COMMANDS ==========
 async def approve_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+    user_id = update.effective_user.id[cite: 3]
     if user_id != OWNER_ID:
-        await update.message.reply_text("❌ Only the bot owner can approve users.")
+        await update.message.reply_text("❌ Only the bot owner can approve users.")[cite: 3]
         return
 
     if not context.args:
-        await update.message.reply_text("⚠️ Usage: `/approve <user_id>`", parse_mode="Markdown")
+        await update.message.reply_text("⚠️ Usage: `/approve <user_id>`", parse_mode="Markdown")[cite: 3]
         return
 
     try:
-        target_id = int(context.args[0].strip())
-        APPROVED_USERS.add(target_id)
-        await update.message.reply_text(f"✅ User `{target_id}` has been approved to use the bot!", parse_mode="Markdown")
+        target_id = int(context.args[0].strip())[cite: 3]
+        APPROVED_USERS.add(target_id)[cite: 3]
+        await update.message.reply_text(f"✅ User `{target_id}` has been approved to use the bot!", parse_mode="Markdown")[cite: 3]
     except ValueError:
-        await update.message.reply_text("❌ Invalid User ID. Please provide a numeric Telegram ID.")
+        await update.message.reply_text("❌ Invalid User ID. Please provide a numeric Telegram ID.")[cite: 3]
 
 async def disapprove_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+    user_id = update.effective_user.id[cite: 3]
     if user_id != OWNER_ID:
-        await update.message.reply_text("❌ Only the bot owner can disapprove users.")
+        await update.message.reply_text("❌ Only the bot owner can disapprove users.")[cite: 3]
         return
 
     if not context.args:
-        await update.message.reply_text("⚠️ Usage: `/disapprove <user_id>`", parse_mode="Markdown")
+        await update.message.reply_text("⚠️ Usage: `/disapprove <user_id>`", parse_mode="Markdown")[cite: 3]
         return
 
     try:
-        target_id = int(context.args[0].strip())
+        target_id = int(context.args[0].strip())[cite: 3]
         if target_id == OWNER_ID:
-            await update.message.reply_text("❌ You cannot disapprove the Owner!")
+            await update.message.reply_text("❌ You cannot disapprove the Owner!")[cite: 3]
             return
         
         if target_id in APPROVED_USERS:
-            APPROVED_USERS.remove(target_id)
-            await update.message.reply_text(f"🚫 User `{target_id}` has been removed from approved users.", parse_mode="Markdown")
+            APPROVED_USERS.remove(target_id)[cite: 3]
+            await update.message.reply_text(f"🚫 User `{target_id}` has been removed from approved users.", parse_mode="Markdown")[cite: 3]
         else:
-            await update.message.reply_text("⚠️ User ID is not currently in the approved list.")
+            await update.message.reply_text("⚠️ User ID is not currently in the approved list.")[cite: 3]
     except ValueError:
-        await update.message.reply_text("❌ Invalid User ID.")
+        await update.message.reply_text("❌ Invalid User ID.")[cite: 3]
 
 async def approved_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+    user_id = update.effective_user.id[cite: 3]
     if user_id != OWNER_ID:
-        await update.message.reply_text("❌ Only the bot owner can view approved users.")
+        await update.message.reply_text("❌ Only the bot owner can view approved users.")[cite: 3]
         return
 
-    users_text = "\n".join([f"• `{uid}`" for uid in APPROVED_USERS])
-    await update.message.reply_text(f"👥 Approved Users List:\n\n{users_text}", parse_mode="Markdown")
+    users_text = "\n".join([f"• `{uid}`" for uid in APPROVED_USERS])[cite: 3]
+    await update.message.reply_text(f"👥 Approved Users List:\n\n{users_text}", parse_mode="Markdown")[cite: 3]
 
 
 # ========== TELEGRAM HANDLER FUNCTIONS ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+    user_id = update.effective_user.id[cite: 3]
     if not is_approved(user_id):
-        await update.message.reply_text(f"🚫 Access Denied!\nYour Telegram User ID is `{user_id}`.\nAsk the owner to approve your access.", parse_mode="Markdown")
+        await update.message.reply_text(f"🚫 Access Denied!\nYour Telegram User ID is `{user_id}`.\nAsk the owner to approve your access.", parse_mode="Markdown")[cite: 3]
         return
 
     try:
-        logger.info(f"📱 /start from {user_id}")
-        await update.message.reply_text(START_TEXT, parse_mode="Markdown")
+        logger.info(f"📱 /start from {user_id}")[cite: 3]
+        await update.message.reply_text(START_TEXT, parse_mode="Markdown")[cite: 3]
     except Exception as e:
-        logger.error(f"Error in start: {e}")
+        logger.error(f"Error in start: {e}")[cite: 3]
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+    user_id = update.effective_user.id[cite: 3]
     if not is_approved(user_id):
-        await update.message.reply_text(f"🚫 Access Denied! Ask the owner to approve User ID: `{user_id}`", parse_mode="Markdown")
+        await update.message.reply_text(f"🚫 Access Denied! Ask the owner to approve User ID: `{user_id}`", parse_mode="Markdown")[cite: 3]
         return
 
     try:
-        logger.info(f"❓ /help from {user_id}")
-        await update.message.reply_text(HELP_TEXT)
+        logger.info(f"❓ /help from {user_id}")[cite: 3]
+        await update.message.reply_text(HELP_TEXT)[cite: 3]
     except Exception as e:
-        logger.error(f"Error in help: {e}")
+        logger.error(f"Error in help: {e}")[cite: 3]
 
 async def addproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+    user_id = update.effective_user.id[cite: 3]
     if not is_approved(user_id):
-        await update.message.reply_text(f"🚫 Access Denied! Ask owner for approval. Your ID: `{user_id}`", parse_mode="Markdown")
+        await update.message.reply_text(f"🚫 Access Denied! Ask owner for approval. Your ID: `{user_id}`", parse_mode="Markdown")[cite: 3]
         return
 
-    global CURRENT_PROXY
+    global CURRENT_PROXY[cite: 3]
     if not context.args:
         await update.message.reply_text(
             "⚠️ Please provide a proxy string.\n\n"
@@ -705,52 +705,64 @@ async def addproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• `/addproxy user:pass@host:port`\n"
             "• `/addproxy user:pass:host:port`",
             parse_mode="Markdown"
-        )
+        )[cite: 3]
         return
 
-    raw_proxy = context.args[0].strip()
-    formatted_proxy = _format_proxy_string(raw_proxy)
+    raw_proxy = context.args[0].strip()[cite: 3]
+    formatted_proxy = _format_proxy_string(raw_proxy)[cite: 3]
 
-    msg = await update.message.reply_text("🔄 Testing proxy connection...", parse_mode="Markdown")
+    msg = await update.message.reply_text("🔄 Testing proxy connection...", parse_mode="Markdown")[cite: 3]
     
-    loop = asyncio.get_running_loop()
-    is_live, status_detail = await loop.run_in_executor(None, _is_proxy_live, formatted_proxy)
+    loop = asyncio.get_running_loop()[cite: 3]
+    is_live, status_detail = await loop.run_in_executor(None, _is_proxy_live, formatted_proxy)[cite: 3]
 
     if is_live:
-        CURRENT_PROXY = formatted_proxy
+        CURRENT_PROXY = formatted_proxy[cite: 3]
         await msg.edit_text(
             f"✅ Proxy Added Successfully!\n\n"
             f"• Proxy: `{formatted_proxy}`\n"
             f"• Status: {status_detail}",
             parse_mode="Markdown"
-        )
+        )[cite: 3]
     else:
         await msg.edit_text(
             f"❌ Proxy Validation Failed!\n\n"
             f"• Error: {status_detail}\n"
             f"The proxy was not added.",
             parse_mode="Markdown"
-        )
+        )[cite: 3]
 
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+    user_id = update.effective_user.id[cite: 3]
     if not is_approved(user_id):
-        await update.message.reply_text(f"🚫 Access Denied! Your ID: `{user_id}`", parse_mode="Markdown")
+        await update.message.reply_text(f"🚫 Access Denied! Your ID: `{user_id}`", parse_mode="Markdown")[cite: 3]
         return
 
-    cancel_bulk_event.set()
-    await update.message.reply_text("🛑 **Stop signal set!** The bulk check will halt on the next iteration.")
+    cancel_bulk_event.set()[cite: 3]
+    await update.message.reply_text("🛑 **Stop signal set!** The bulk check will halt on the next iteration.")[cite: 3]
 
 async def handle_cookie_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        if not update.message:
+        if not update.message or not update.message.text:
             return
 
+        cookie_input = update.message.text.strip()
+        
+        # 1. Silently ignore normal group conversation text
+        cookie_header = _build_cookie_header(cookie_input)
+        if not cookie_header:
+            return
+
+        # 2. Enforce access approval only when actual cookie is pasted
         user_id = update.effective_user.id
         if not is_approved(user_id):
-            await update.message.reply_text(f"🚫 Access Denied!\nYour Telegram User ID is `{user_id}`.\nContact the owner to grant you access.", parse_mode="Markdown")
+            await update.message.reply_text(
+                f"🚫 Access Denied!\nYour Telegram User ID is `{user_id}`.\nContact the owner to grant you access.", 
+                parse_mode="Markdown"
+            )
             return
 
+        # 3. Proxy requirement check
         if not CURRENT_PROXY:
             await update.message.reply_text(
                 "⚠️ **Proxy Required!**\n\n"
@@ -760,25 +772,7 @@ async def handle_cookie_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
             return
 
-        cookie_input = (update.message.text or "").strip()
-        logger.info(f"📨 Message from {user_id}: {len(cookie_input)} chars")
-        
-        if not cookie_input:
-            await update.message.reply_text("Please paste your cookies.")
-            return
-
-        cookie_header = _build_cookie_header(cookie_input)
-        if not cookie_header:
-            await update.message.reply_text(
-                "❌ Could not parse cookies.\n\n"
-                "Paste in one of these formats:\n"
-                "• Full `Cookie:` header line\n"
-                "• Netscape format (.txt cookie file)\n"
-                "• JSON array format\n"
-                "• Key=Value pairs (NetflixId=..., SecureNetflixId=...)"
-            )
-            return
-
+        logger.info(f"📨 Cookie check request from {user_id}: {len(cookie_input)} chars")
         preview = _safe_preview_cookie_keys(cookie_header)
         msg = await update.message.reply_text(f"🔎 Checking Netflix cookies...\n(Keys: {preview})")
 
@@ -835,15 +829,22 @@ async def handle_cookie_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
             logger.warning(f"❌ Cookie validation failed for {user_id}: {detail}")
     except Exception as e:
         logger.error(f"Error in handle_cookie_text: {e}", exc_info=True)
-        try:
-            await update.message.reply_text("❌ Error processing request")
-        except Exception:
-            pass
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    document = update.message.document
+    filename = document.file_name or "document"
+    
+    # 1. Silently ignore non-cookie document uploads (PDFs, Images, MP3s, etc.)
+    if not filename.endswith(('.txt', '.zip')):
+        return
+
+    # 2. Enforce access control for cookie files
     user_id = update.effective_user.id
     if not is_approved(user_id):
-        await update.message.reply_text(f"🚫 Access Denied!\nYour Telegram User ID is `{user_id}`.\nContact owner for access.", parse_mode="Markdown")
+        await update.message.reply_text(
+            f"🚫 Access Denied!\nYour Telegram User ID is `{user_id}`.\nContact owner for access.", 
+            parse_mode="Markdown"
+        )
         return
 
     if not CURRENT_PROXY:
@@ -853,13 +854,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Use `/addproxy` to set one.",
             parse_mode="Markdown"
         )
-        return
-
-    document = update.message.document
-    filename = document.file_name or "document"
-    
-    if not filename.endswith(('.txt', '.zip')):
-        await update.message.reply_text("⚠️ Please upload a valid `.txt` cookie file or a `.zip` archive.")
         return
 
     cancel_bulk_event.clear()
