@@ -187,8 +187,8 @@ def _is_netscape_cookie(text: str) -> bool:
     for line in lines:
         line = line.strip()[cite: 3]
         if not line or line.startswith('#'):
-            continue[cite: 3]
-        
+            continue
+     
         if '\t' in line:
             parts = line.split('\t')[cite: 3]
             if len(parts) >= 7:
