@@ -266,26 +266,19 @@ def health():
 # ========== START & HELP MESSAGES ==========
 START_TEXT = (
     "👋 Netflix Cookie Checker Bot\n\n"
-    "⚠️ IMPORTANT: You MUST set a proxy using /addproxy before checking any cookies.\n\n"
+    "⚠️ Paste the cookie or upload `.txt` file, `.zip` archive to get your login link.\n\n"
     "Available Commands:\n"
-    "• /addproxy `<proxy>` — Add & test an HTTP proxy (REQUIRED)\n"
     "• /redeem `<code>` — Claim 24-hour promo access\n"
-    "• /stop — Halt an ongoing bulk check immediately\n"
     "• /help — Usage instructions\n\n"
-    "Owner Commands:\n"
-    "• /genkey `[custom_code]` — Generate 24h promo code\n"
-    "• /approve `<userid>` — Permanent user approval\n"
-    "• /disapprove `<userid>` — Revoke access\n"
-    "• /approved — View list of approved users\n\n"
     " Bot by @zyokr 🦖"
 )
 
 HELP_TEXT = (
     "How to use:\n"
     "1. Access is restricted. Ask owner for approval or claim a key with `/redeem <code>`.\n"
-    "2. MANDATORY: Set a working proxy using `/addproxy` before checking.\n"
+    "2. Contact owner if any problem persists.\n"
     "3. Paste cookies as text, upload a `.txt` file, or upload a `.zip` archive.\n"
-    "4. Use `/stop` anytime to halt bulk processing."
+    "4. If you face (Error Processing Document) then upload the cookie again."
 )
 
 COOKIE_KV_RE = re.compile(r"^\s*([A-Za-z0-9_\\-]+)\s*=\s*(.+?)\s*$", re.DOTALL)
