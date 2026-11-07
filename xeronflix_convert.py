@@ -879,6 +879,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         # OUTPUT DECISION: Single vs. Bulk Results
+        # OUTPUT DECISION: Single vs. Bulk Results
         if len(valid_accounts_list) == 1:
             acct = valid_accounts_list[0]
             nftoken = acct.get("nftoken", "")
@@ -886,22 +887,22 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             phone_link = f"https://www.netflix.com/unsupported?nftoken={nftoken}" if nftoken else "N/A"
 
             card_text = (
-                f"📁 **Source:** `{acct.get('source_tag', filename)}`\n"
-                f"✅ **Status:** Valid Account\n\n"
-                f"👤 **Account Details:**\n"
-                f"• **Name:** {acct.get('name')}\n"
-                f"• **Email:** {acct.get('email')}\n"
-                f"• **Country:** {acct.get('country')}\n"
-                f"• **Plan:** {acct.get('plan')}\n"
-                f"• **Price:** {acct.get('plan_price')}\n"
-                f"• **Member Since:** {acct.get('member_since')}\n"
-                f"• **Next Billing:** {acct.get('next_billing')}\n"
-                f"• **Payment Method:** {acct.get('payment_method')}\n"
-                f"• **Payment Status:** {acct.get('payment_status')}\n"
-                f"• **Phone:** {acct.get('phone')}\n"
-                f"• **Quality:** {acct.get('video_quality')}\n"
-                f"• **Streams:** {acct.get('max_streams')}\n"
-                f"• **Profiles:** {acct.get('profiles')}\n\n"
+                f"📁 <b>Source:</b> <code>{html.escape(acct.get('source_tag', filename))}</code>\n"
+                f"✅ <b>Status:</b> Valid Account\n\n"
+                f"👤 <b>Account Details:</b>\n"
+                f"• <b>Name:</b> {html.escape(acct.get('name', 'Unknown'))}\n"
+                f"• <b>Email:</b> {html.escape(acct.get('email', 'Unknown'))}\n"
+                f"• <b>Country:</b> {html.escape(acct.get('country', 'Unknown'))}\n"
+                f"• <b>Plan:</b> {html.escape(acct.get('plan', 'Unknown'))}\n"
+                f"• <b>Price:</b> {html.escape(acct.get('plan_price', 'N/A'))}\n"
+                f"• <b>Member Since:</b> {html.escape(acct.get('member_since', 'Unknown'))}\n"
+                f"• <b>Next Billing:</b> {html.escape(acct.get('next_billing', 'Unknown'))}\n"
+                f"• <b>Payment Method:</b> {html.escape(acct.get('payment_method', 'CC'))}\n"
+                f"• <b>Payment Status:</b> {html.escape(acct.get('payment_status', 'Active / Paid'))}\n"
+                f"• <b>Phone:</b> {html.escape(acct.get('phone', 'N/A'))}\n"
+                f"• <b>Quality:</b> {html.escape(acct.get('video_quality', 'HD'))}\n"
+                f"• <b>Streams:</b> {html.escape(acct.get('max_streams', '2'))}\n"
+                f"• <b>Profiles:</b> {html.escape(acct.get('profiles', 'Unknown'))}\n\n"
                 f"🦖 Bot by @zyokr"
             )
 
@@ -910,7 +911,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("📱 Phone Login", url=phone_link)
             ]]) if nftoken else None
 
-            await update.message.reply_text(card_text, reply_markup=markup, parse_mode="Markdown")
+            await update.message.reply_text(card_text, reply_markup=markup, parse_mode="HTML")
 
         elif len(valid_accounts_list) > 1:
             report_filename = f"results_{os.path.splitext(filename)[0]}.txt"
@@ -921,7 +922,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_document(
                     document=doc_file,
                     filename=report_filename,
-                    caption=f"📄 **Results Summary** ({len(valid_accounts_list)} accounts found)"
+                    caption=f"📄 <b>Results Summary</b> ({len(valid_accounts_list)} accounts found)",
+                    parse_mode="HTML"
                 )
     except Exception as e:
         await status_msg.edit_text(f"❌ Error: {e}")
