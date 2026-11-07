@@ -871,14 +871,48 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 dead_count += 1
 
         await status_msg.edit_text(
-            f"✅ **Bulk Check Finished!**\n\n"
+            f"✅ **Check Completed!**\n\n"
             f"📊 Total: {total_cookies}\n"
             f"🟢 Valid: {valid_count}\n"
             f"🔴 Dead: {dead_count}",
             parse_mode="Markdown"
         )
 
-        if valid_accounts_list:
+        # OUTPUT DECISION: Single vs. Bulk Results
+        if len(valid_accounts_list) == 1:
+            acct = valid_accounts_list[0]
+            nftoken = acct.get("nftoken", "")
+            desktop_link = f"https://www.netflix.com/browse?nftoken={nftoken}" if nftoken else "N/A"
+            phone_link = f"https://www.netflix.com/unsupported?nftoken={nftoken}" if nftoken else "N/A"
+
+            card_text = (
+                f"📁 **Source:** `{acct.get('source_tag', filename)}`\n"
+                f"✅ **Status:** Valid Account\n\n"
+                f"👤 **Account Details:**\n"
+                f"• **Name:** {acct.get('name')}\n"
+                f"• **Email:** {acct.get('email')}\n"
+                f"• **Country:** {acct.get('country')}\n"
+                f"• **Plan:** {acct.get('plan')}\n"
+                f"• **Price:** {acct.get('plan_price')}\n"
+                f"• **Member Since:** {acct.get('member_since')}\n"
+                f"• **Next Billing:** {acct.get('next_billing')}\n"
+                f"• **Payment Method:** {acct.get('payment_method')}\n"
+                f"• **Payment Status:** {acct.get('payment_status')}\n"
+                f"• **Phone:** {acct.get('phone')}\n"
+                f"• **Quality:** {acct.get('video_quality')}\n"
+                f"• **Streams:** {acct.get('max_streams')}\n"
+                f"• **Profiles:** {acct.get('profiles')}\n\n"
+                f"🦖 Bot by @zyokr"
+            )
+
+            markup = InlineKeyboardMarkup([[
+                InlineKeyboardButton("💻 PC Login", url=desktop_link),
+                InlineKeyboardButton("📱 Phone Login", url=phone_link)
+            ]]) if nftoken else None
+
+            await update.message.reply_text(card_text, reply_markup=markup, parse_mode="Markdown")
+
+        elif len(valid_accounts_list) > 1:
             report_filename = f"results_{os.path.splitext(filename)[0]}.txt"
             report_path = os.path.join(temp_dir, report_filename)
             with open(report_path, "w", encoding="utf-8") as rf:
