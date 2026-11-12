@@ -3,3 +3,4 @@ requests
 flask
 gunicorn
 psycopg2-binary
+httpx
