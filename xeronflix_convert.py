@@ -2,6 +2,7 @@ import os
 import asyncio
 import logging
 import re
+import httpx
 from typing import Dict, Optional, Tuple, Set
 import time
 from threading import Thread
@@ -38,6 +39,23 @@ PORT = int(os.environ.get("PORT", 8000))
 OWNER_ID = int(os.environ.get("OWNER_ID", 6420446828))
 SUPABASE_URI = os.environ.get("SUPABASE_URI", os.environ.get("DATABASE_URL", ""))
 
+# ========== EXTERNAL REDEEM API CONFIG ==========
+REDEEM_API_KEY = os.environ.get("REDEEM_API_KEY", "")
+REDEEM_BASE_URL = "https://xerodel.new.tg"
+
+async def verify_redeem_code(code: str, telegram_id: int) -> dict:
+    """Verifies a redeem code against the external service and returns the JSON response."""
+    url = f"{REDEEM_BASE_URL}/api/redeem/verify"
+    params = {"code": code, "telegram_id": telegram_id}
+    headers = {"X-Api-Key": REDEEM_API_KEY}
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(url, params=params, headers=headers)
+            return resp.json()
+    except Exception as e:
+        logger.error(f"Redeem API error: {e}")
+        return {"ok": False, "error": "Verification service unreachable. Try again later."}
+        
 # ========== LOGGING SETUP ==========
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -687,20 +705,34 @@ async def genkey_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def redeem_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not context.args:
-        await update.message.reply_text("Usage: `/redeem <code>`", parse_mode="Markdown")
+        await update.message.reply_text("Usage: <code>/redeem &lt;code&gt;</code>", parse_mode="HTML")
         return
 
-    code = context.args[0].strip().upper()
-    if db_burn_promo_key(code):
-        exp_time = time.time() + (24 * 3600)
+    code = context.args[0].strip()
+    status_msg = await update.message.reply_text("🔄 Verifying promo code...")
+
+    result = await verify_redeem_code(code, user_id)
+
+    if result and result.get("ok"):
+        # Use duration from API response if provided (in hours or seconds), otherwise default to 24h
+        hours = result.get("hours") or result.get("duration_hours") or 24
+        expires_at = result.get("expires_at")
+
+        if expires_at and isinstance(expires_at, (int, float)) and expires_at > time.time():
+            exp_time = float(expires_at)
+        else:
+            exp_time = time.time() + (float(hours) * 3600)
+
         db_set_temp_access(user_id, exp_time)
-        await update.message.reply_text(
-            f"🎉 **Promo Code Claimed!**\n\n"
-            f"Granted **24-Hour Access** to your account (`{user_id}`).",
-            parse_mode="Markdown"
+
+        await status_msg.edit_text(
+            f"🎉 <b>Promo Code Claimed!</b>\n\n"
+            f"Granted <b>{int(hours)}-Hour Access</b> to your account (<code>{user_id}</code>).",
+            parse_mode="HTML"
         )
     else:
-        await update.message.reply_text("❌ Invalid or already used promo key.")
+        error_reason = html.escape(str(result.get("error", "Invalid or already used promo key."))) if result else "Invalid or already used promo key."
+        await status_msg.edit_text(f"❌ {error_reason}", parse_mode="HTML")
 
 # ========== TELEGRAM HANDLERS ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
