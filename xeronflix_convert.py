@@ -33,7 +33,7 @@ except ImportError:
     HAS_POSTGRES = False
 
 # ========== CONFIGURATION ==========
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8915335839:AAGRpBFdulQwjjsaKvhZ-aiEUtY7VQdjV3o")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 PORT = int(os.environ.get("PORT", 8000))
 OWNER_ID = int(os.environ.get("OWNER_ID", 6420446828))
 SUPABASE_URI = os.environ.get("SUPABASE_URI", os.environ.get("DATABASE_URL", ""))
