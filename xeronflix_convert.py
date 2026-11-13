@@ -603,7 +603,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     welcome_text = pe(
-        f"🎬 <b>Xeronflix Cookie Checker & Order Redeemer</b>\n\n"
+        f"🎬 <b>Xeronflix Cookie Checker</b>\n\n"
         f"{status_line}\n"
         f"🆔 <b>Your ID:</b> <code>{user_id}</code>\n\n"
         f"<b>Quick Start:</b>\n"
