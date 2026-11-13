@@ -73,6 +73,7 @@ PREMIUM_EMOJI_MAP = {
     "🔑": "6026218958900695642",  # Promo Key
     "📖": "6181322172263308706",  # Help
     "🛑": "6181277564732972292",  # Stopped
+    "🔱": "5785265173266698665",  # Add this line for your XERON credit footer
 }
 
 BTN_EMOJI_PC = "5235785929502761186"     # Paste custom_emoji_id for 💻 here
