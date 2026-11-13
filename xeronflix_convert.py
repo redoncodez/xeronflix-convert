@@ -14,7 +14,7 @@ import httpx
 import psycopg2
 from urllib.parse import unquote
 from flask import Flask
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest, TimedOut
 from telegram.ext import (
     Application,
@@ -78,7 +78,6 @@ PREMIUM_EMOJI_MAP = {
 
 BTN_EMOJI_PC = "5235785929502761186"     # Paste custom_emoji_id for 💻 here
 BTN_EMOJI_PHONE = "6026092115631543342"  # Paste custom_emoji_id for 📱 here
-
 def pe(text: str) -> str:
     """Automatically converts every mapped standard emoji in an HTML string into a <tg-emoji> tag."""
     for std_emoji, custom_id in PREMIUM_EMOJI_MAP.items():
@@ -116,8 +115,8 @@ async def safe_edit(message, html_text: str, **kwargs):
         return message
 
 # ========== ACTIVE CHECK TRACKING (/stop) ==========
-ACTIVE_CHECKS = set()   # user_ids currently running a batch check
-STOP_REQUESTED = set()  # user_ids that triggered /stop
+ACTIVE_CHECKS = set()
+STOP_REQUESTED = set()
 
 # ========== XERODEL REDEEM API & ERROR MESSAGES ==========
 FAILURE_TEXT = {
@@ -126,7 +125,7 @@ FAILURE_TEXT = {
     "code_already_used": "This code has already been used. Each code works once.",
     "code_expired": "This code expired after 24 hours. Please contact support.",
     "unauthorized": "Server key mismatch — please tell the admin.",
-    "network": "Could not reach the server. Please try again in a moment.",
+    "network": "Could not reach the order server right now. Please try again in a moment.",
     "cookie_missing": "The code is valid but the cookie is empty — please contact support.",
 }
 
@@ -179,8 +178,8 @@ async def verify_redeem_code(code: str, telegram_id: int) -> dict:
 
 # ========== IN-MEMORY FALLBACK & SUPABASE STORAGE ==========
 MEM_APPROVED_USERS = {OWNER_ID}
-MEM_TEMP_USERS = {}    # {user_id: expires_at}
-MEM_PROMO_KEYS = {}    # {key_code: duration_hours}
+MEM_TEMP_USERS = {}
+MEM_PROMO_KEYS = {}
 MEM_SETTINGS = {"global_proxy": GLOBAL_PROXY}
 
 def get_db_conn():
@@ -261,21 +260,23 @@ def db_set_proxy(proxy_url: str):
 def db_is_authorized(user_id: int) -> bool:
     if user_id == OWNER_ID:
         return True
+    if user_id in MEM_APPROVED_USERS or MEM_TEMP_USERS.get(user_id, 0) > time.time():
+        return True
     if not SUPABASE_URI:
-        if user_id in MEM_APPROVED_USERS:
-            return True
-        return MEM_TEMP_USERS.get(user_id, 0) > time.time()
+        return False
     try:
         conn = get_db_conn()
         with conn.cursor() as cur:
             cur.execute("SELECT 1 FROM approved_users WHERE user_id = %s;", (user_id,))
             if cur.fetchone():
                 conn.close()
+                MEM_APPROVED_USERS.add(user_id)
                 return True
             cur.execute("SELECT expires_at FROM temp_users WHERE user_id = %s;", (user_id,))
             row = cur.fetchone()
             conn.close()
             if row and row[0] > time.time():
+                MEM_TEMP_USERS[user_id] = row[0]
                 return True
     except Exception as e:
         logger.error(f"DB auth check error: {e}")
@@ -333,6 +334,7 @@ def db_set_temp_access(user_id: int, expires_at: float):
         logger.error(f"DB set temp access error: {e}")
 
 def db_create_promo_key(key_code: str, hours: int):
+    key_code = normalize_code(key_code)
     MEM_PROMO_KEYS[key_code] = hours
     if not SUPABASE_URI:
         return
@@ -341,7 +343,11 @@ def db_create_promo_key(key_code: str, hours: int):
         with conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO promo_keys (key_code, duration_hours) VALUES (%s, %s);",
+                    """
+                    INSERT INTO promo_keys (key_code, duration_hours)
+                    VALUES (%s, %s)
+                    ON CONFLICT (key_code) DO UPDATE SET duration_hours = EXCLUDED.duration_hours;
+                    """,
                     (key_code, hours),
                 )
         conn.close()
@@ -350,8 +356,9 @@ def db_create_promo_key(key_code: str, hours: int):
 
 def db_burn_promo_key(key_code: str) -> int | None:
     key_code = normalize_code(key_code)
+    mem_hours = MEM_PROMO_KEYS.pop(key_code, None)
     if not SUPABASE_URI:
-        return MEM_PROMO_KEYS.pop(key_code, None)
+        return mem_hours
     try:
         conn = get_db_conn()
         with conn:
@@ -362,10 +369,10 @@ def db_burn_promo_key(key_code: str) -> int | None:
                 )
                 row = cur.fetchone()
         conn.close()
-        return row[0] if row else None
+        return row[0] if row else mem_hours
     except Exception as e:
         logger.error(f"DB burn promo key error: {e}")
-    return None
+        return mem_hours
 
 # ========== COOKIE PARSING & NETFLIX CHECKER ==========
 def parse_cookies_from_text(raw_text: str) -> dict:
@@ -493,7 +500,7 @@ def build_single_card(acct: dict) -> tuple[str, InlineKeyboardMarkup]:
         f"🌍 <b>Country:</b> {html.escape(acct['country'])}\n"
         f"📅 <b>Expiry:</b> {html.escape(acct['expiry'])}\n"
         f"📧 <b>Email:</b> <code>{html.escape(acct['email'])}</code>\n\n"
-        f"<b> 🔱 XERON</b>"
+        f"<b>🔱 XERON</b>"
     )
 
     pc_btn_kwargs = {"icon_custom_emoji_id": BTN_EMOJI_PC} if BTN_EMOJI_PC else {}
@@ -589,7 +596,7 @@ async def process_redeem_code(update: Update, raw_code: str):
 
     status_msg = await safe_reply(update, "🔄 Verifying code...")
 
-    # 1. Check local /genkey XERO- promo keys in Supabase (non-blocking)
+    # 1. Check local /genkey XERO- promo keys in Supabase + RAM first (non-blocking)
     local_hours = await asyncio.to_thread(db_burn_promo_key, norm_code)
     if local_hours is not None:
         exp_time = time.time() + (local_hours * 3600)
@@ -601,7 +608,7 @@ async def process_redeem_code(update: Update, raw_code: str):
         )
         return
 
-    # 2. Check Xerodel API for order session cookies
+    # 2. Otherwise check Xerodel API for order session cookies
     result = await verify_redeem_code(norm_code, user_id)
 
     if not result.get("ok"):
@@ -632,10 +639,11 @@ async def process_redeem_code(update: Update, raw_code: str):
         reply_markup=keyboard,
         disable_web_page_preview=True,
     )
+
 # ========== TELEGRAM COMMAND HANDLERS ==========
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    auth = db_is_authorized(user_id)
+    auth = await asyncio.to_thread(db_is_authorized, user_id)
     status_line = (
         "✅ <b>Checker Mode:</b> Active"
         if auth
@@ -643,40 +651,27 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     welcome_text = (
-        f"🎬 <b>Xeronflix Cookie Checker &amp; Order Redeemer</b>\n\n"
+        f"🎬 <b>Xeronflix Cookie Checker & Order Redeemer</b>\n\n"
         f"{status_line}\n"
         f"🆔 <b>Your ID:</b> <code>{user_id}</code>\n\n"
         f"<b>Quick Start:</b>\n"
-        f"• Redeem order or promo key: <code>/redeem &lt;code&gt;</code>\n"
+        f"• Redeem order or promo key: <code>/redeem XERO-XXXX-XXXX</code>\n"
         f"• View all commands: <code>/help</code>"
     )
     await safe_reply(update, welcome_text)
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
     help_text = (
-        f"📖 <b>Xeronflix Bot Commands &amp; Guide</b>\n\n"
+        f"📖 <b>Xeronflix Bot Commands & Guide</b>\n\n"
         f"<b>User Commands:</b>\n"
-        f"• <code>/start</code> — Check your access status &amp; Telegram ID\n"
+        f"• <code>/start</code> — Check your access status & Telegram ID\n"
         f"• <code>/help</code> — Show this command menu\n"
-        f"• <code>/redeem &lt;code&gt;</code> — Redeem a Xerodel order code or promo key\n"
+        f"• <code>/redeem <code></code> — Redeem a Xerodel order code or promo key\n"
         f"• <code>/stop</code> — Instantly stop an ongoing ZIP/batch check\n\n"
         f"<b>Cookie Checking (Authorized Users):</b>\n"
         f"• Paste raw Netflix cookies (JSON, Netscape, or Header format)\n"
         f"• Upload a single <code>.txt</code> or bulk <code>.zip</code> archive"
     )
-
-    if user_id == OWNER_ID:
-        proxy_status = html.escape(get_active_proxy()) if get_active_proxy() else "None (Direct)"
-        help_text += (
-            f"\n\n🔑 <b>Owner Admin Commands:</b>\n"
-            f"• <code>/approve &lt;user_id&gt;</code> — Grant permanent access\n"
-            f"• <code>/revoke &lt;user_id&gt;</code> — Remove user access\n"
-            f"• <code>/genkey [hours]</code> — Generate a one-time promo key (default 24h)\n"
-            f"• <code>/addproxy &lt;url&gt;</code> — Set global HTTP proxy (<code>off</code> to clear)\n"
-            f"🌍 <b>Current Proxy:</b> <code>{proxy_status}</code>"
-        )
-
     await safe_reply(update, help_text)
 
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -697,20 +692,20 @@ async def approve_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return
     if not context.args or not context.args[0].isdigit():
-        await safe_reply(update, "⚠️ Usage: <code>/approve &lt;user_id&gt;</code>")
+        await safe_reply(update, "⚠️ Usage: <code>/approve <user_id></code>")
         return
     target_id = int(context.args[0])
-    db_add_approved(target_id)
+    await asyncio.to_thread(db_add_approved, target_id)
     await safe_reply(update, f"✅ Approved user <code>{target_id}</code>.")
 
 async def revoke_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return
     if not context.args or not context.args[0].isdigit():
-        await safe_reply(update, "⚠️ Usage: <code>/revoke &lt;user_id&gt;</code>")
+        await safe_reply(update, "⚠️ Usage: <code>/revoke <user_id></code>")
         return
     target_id = int(context.args[0])
-    db_remove_approved(target_id)
+    await asyncio.to_thread(db_remove_approved, target_id)
     await safe_reply(update, f"🚫 Revoked access for <code>{target_id}</code>.")
 
 async def genkey_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -723,7 +718,7 @@ async def genkey_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     part1 = secrets.token_hex(2).upper()
     part2 = secrets.token_hex(2).upper()
     key_code = f"XERO-{part1}-{part2}"
-    db_create_promo_key(key_code, hours)
+    await asyncio.to_thread(db_create_promo_key, key_code, hours)
 
     await safe_reply(
         update,
@@ -750,18 +745,18 @@ async def addproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     val = context.args[0].strip()
     if val.lower() in ("off", "none", "clear", "remove", "delete"):
-        db_set_proxy("")
+        await asyncio.to_thread(db_set_proxy, "")
         await safe_reply(update, "✅ Global proxy cleared. Bot will use direct connection.")
         return
 
     if not (val.startswith("http://") or val.startswith("https://") or val.startswith("socks5://")):
         val = f"http://{val}"
 
-    db_set_proxy(val)
+    await asyncio.to_thread(db_set_proxy, val)
     await safe_reply(update, f"✅ <b>Global Proxy Updated!</b>\n<code>{html.escape(val)}</code>")
 
 # ========== TEXT & FILE HANDLERS ==========
-CODE_PATTERN = re.compile(r"^(XERO|KEY)-[A-Z0-9]{4,12}(-[A-Z0-9]{4})?$", re.IGNORECASE)
+CODE_PATTERN = re.compile(r"^XERO-[A-Z0-9]{4,12}(-[A-Z0-9]{4})?$", re.IGNORECASE)
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw_text = (update.message.text or "").strip()
@@ -771,10 +766,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_id = update.effective_user.id
-    if not db_is_authorized(user_id):
+    if not await asyncio.to_thread(db_is_authorized, user_id):
         await safe_reply(
             update,
-            "🔒 You are not authorized. Redeem a code with <code>/redeem &lt;code&gt;</code> or check <code>/help</code>.",
+            "🔒 You are not authorized. Redeem a code with <code>/redeem XERO-XXXX-XXXX</code> or check <code>/help</code>.",
         )
         return
 
@@ -794,10 +789,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if not db_is_authorized(user_id):
+    if not await asyncio.to_thread(db_is_authorized, user_id):
         await safe_reply(
             update,
-            "🔒 File checking is restricted to approved users. Use <code>/redeem &lt;code&gt;</code> first.",
+            "🔒 File checking is restricted to approved users. Use <code>/redeem XERO-XXXX-XXXX</code> first.",
         )
         return
 
@@ -859,7 +854,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cookies = parse_cookies_from_text(content)
             if cookies and "NetflixId" in cookies:
                 checked_count += 1
-                # Throttled progress update every 15 files to avoid Telegram TimedOut/Flood
                 if checked_count == 1 or checked_count % 15 == 0:
                     await safe_edit(
                         status_msg,
@@ -882,19 +876,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await send_results(update, status_msg, valid_accounts, checked_count, was_stopped=was_stopped)
 
-# ========== TELEGRAM COMMAND MENU REGISTRATION ==========
+# ========== TELEGRAM COMMAND MENU (HIDDEN FROM MENU BAR) ==========
 async def post_init(application: Application):
-    await application.bot.set_my_commands([
-        BotCommand("start", "Check bot status & your ID"),
-        BotCommand("help", "Show all commands & usage guide"),
-        BotCommand("redeem", "Redeem an order code or promo key"),
-        BotCommand("stop", "Stop an ongoing ZIP/batch check"),
-        # Hidden from menu bar (still work when typed):
-        # BotCommand("approve", "Owner: Approve a user ID"),
-        # BotCommand("revoke", "Owner: Revoke a user ID"),
-        # BotCommand("genkey", "Owner: Generate a promo access key"),
-        # BotCommand("addproxy", "Owner: Set or clear global HTTP proxy"),
-    ])
+    await application.bot.delete_my_commands()
+
 # ========== FLASK HEALTH ENDPOINT ==========
 flask_app = Flask(__name__)
 
