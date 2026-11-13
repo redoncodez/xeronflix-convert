@@ -73,6 +73,7 @@ PREMIUM_EMOJI_MAP = {
     "🔑": "6026218958900695642",  # Promo Key
     "📖": "6181322172263308706",  # Help
     "🛑": "6181277564732972292",  # Stopped
+    "🔱": "5785265173266698665",  # Add this line for your XERON credit footer
 }
 
 BTN_EMOJI_PC = "5235785929502761186"     # Paste custom_emoji_id for 💻 here
@@ -491,7 +492,8 @@ def build_single_card(acct: dict) -> tuple[str, InlineKeyboardMarkup]:
         f"🎬 <b>Plan:</b> {html.escape(acct['plan'])}\n"
         f"🌍 <b>Country:</b> {html.escape(acct['country'])}\n"
         f"📅 <b>Expiry:</b> {html.escape(acct['expiry'])}\n"
-        f"📧 <b>Email:</b> <code>{html.escape(acct['email'])}</code>"
+        f"📧 <b>Email:</b> <code>{html.escape(acct['email'])}</code>\n\n"
+        f"<b> 🔱XERON</b>"
     )
 
     pc_btn_kwargs = {"icon_custom_emoji_id": BTN_EMOJI_PC} if BTN_EMOJI_PC else {}
