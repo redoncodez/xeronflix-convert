@@ -50,7 +50,7 @@ REDEEM_BASE_URL = (
     or "https://xerodel.new.tg"
 ).strip().rstrip("/")
 VERIFY_PATH = "/api/redeem/verify"
-REDEEM_TIMEOUT = 20
+REDEEM_TIMEOUT = 8
 
 # Default Global HTTP Proxy (can be updated live via /addproxy)
 GLOBAL_PROXY = os.environ.get("GLOBAL_PROXY", "")
@@ -186,7 +186,7 @@ MEM_SETTINGS = {"global_proxy": GLOBAL_PROXY}
 def get_db_conn():
     if not SUPABASE_URI:
         return None
-    return psycopg2.connect(SUPABASE_URI, sslmode="require")
+    return psycopg2.connect(SUPABASE_URI, sslmode="require", connect_timeout=5)
 
 def init_db():
     if not SUPABASE_URI:
@@ -589,11 +589,11 @@ async def process_redeem_code(update: Update, raw_code: str):
 
     status_msg = await safe_reply(update, "🔄 Verifying code...")
 
-    # 1. Check local /genkey XERO- promo keys in Supabase first
-    local_hours = db_burn_promo_key(norm_code)
+    # 1. Check local /genkey XERO- promo keys in Supabase (non-blocking)
+    local_hours = await asyncio.to_thread(db_burn_promo_key, norm_code)
     if local_hours is not None:
         exp_time = time.time() + (local_hours * 3600)
-        db_set_temp_access(user_id, exp_time)
+        await asyncio.to_thread(db_set_temp_access, user_id, exp_time)
         await safe_edit(
             status_msg,
             f"🎉 <b>Promo Key Redeemed!</b>\n\n"
@@ -601,7 +601,7 @@ async def process_redeem_code(update: Update, raw_code: str):
         )
         return
 
-    # 2. Otherwise check Xerodel API for order session cookies
+    # 2. Check Xerodel API for order session cookies
     result = await verify_redeem_code(norm_code, user_id)
 
     if not result.get("ok"):
@@ -632,7 +632,6 @@ async def process_redeem_code(update: Update, raw_code: str):
         reply_markup=keyboard,
         disable_web_page_preview=True,
     )
-
 # ========== TELEGRAM COMMAND HANDLERS ==========
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
