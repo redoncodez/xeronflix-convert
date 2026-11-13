@@ -876,12 +876,12 @@ async def post_init(application: Application):
         BotCommand("help", "Show all commands & usage guide"),
         BotCommand("redeem", "Redeem an order code or promo key"),
         BotCommand("stop", "Stop an ongoing ZIP/batch check"),
-        BotCommand("approve", "Owner: Approve a user ID"),
-        BotCommand("revoke", "Owner: Revoke a user ID"),
-        BotCommand("genkey", "Owner: Generate a promo access key"),
-        BotCommand("addproxy", "Owner: Set or clear global HTTP proxy"),
+        # Hidden from menu bar (still work when typed):
+        # BotCommand("approve", "Owner: Approve a user ID"),
+        # BotCommand("revoke", "Owner: Revoke a user ID"),
+        # BotCommand("genkey", "Owner: Generate a promo access key"),
+        # BotCommand("addproxy", "Owner: Set or clear global HTTP proxy"),
     ])
-
 # ========== FLASK HEALTH ENDPOINT ==========
 flask_app = Flask(__name__)
 
