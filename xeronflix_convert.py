@@ -708,7 +708,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Upload a single <code>.txt</code> or bulk <code>.zip</code> archive"
     )
     await safe_reply(update, help_text)
-
+    
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id in ACTIVE_CHECKS:
