@@ -73,43 +73,67 @@ PREMIUM_EMOJI_MAP = {
     "🔑": "6026218958900695642",  # Promo Key
     "📖": "6181322172263308706",  # Help
     "🛑": "6181277564732972292",  # Stopped
-    "🔱": "5785265173266698665",  # Add this line for your XERON credit footer
 }
 
 BTN_EMOJI_PC = "5235785929502761186"     # Paste custom_emoji_id for 💻 here
 BTN_EMOJI_PHONE = "6026092115631543342"  # Paste custom_emoji_id for 📱 here
+
+def _normalize_emoji_key(s: str) -> str:
+    return s.replace("\ufe0f", "")
+
 def pe(text: str) -> str:
-    """Automatically converts every mapped standard emoji in an HTML string into a <tg-emoji> tag."""
+    """Converts every mapped emoji in PREMIUM_EMOJI_MAP into a <tg-emoji> tag, handling variation selectors."""
     for std_emoji, custom_id in PREMIUM_EMOJI_MAP.items():
-        if custom_id:
-            text = text.replace(std_emoji, f'<tg-emoji emoji-id="{custom_id}">{std_emoji}</tg-emoji>')
+        clean_id = (custom_id or "").strip()
+        if not clean_id:
+            continue
+        tag = f'<tg-emoji emoji-id="{clean_id}">{std_emoji}</tg-emoji>'
+        if std_emoji in text:
+            text = text.replace(std_emoji, tag)
+        base_emoji = _normalize_emoji_key(std_emoji)
+        if base_emoji != std_emoji and base_emoji in text:
+            text = text.replace(base_emoji, tag)
     return text
 
-# ========== SAFE SEND / EDIT HELPERS (HTML & TIMEOUT RESILIENT) ==========
+def strip_tg_emoji_only(text: str) -> str:
+    """Removes <tg-emoji> wrappers while preserving <b>, <code>, and standard emojis."""
+    return re.sub(r"</?tg-emoji[^>]*>", "", text)
+
 def strip_html_tags(text: str) -> str:
     clean = re.sub(r"<[^>]+>", "", text)
     return html.unescape(clean)
 
+# ========== SAFE SEND / EDIT HELPERS (HTML & EMOJI FALLBACK) ==========
 async def safe_reply(update: Update, html_text: str, **kwargs):
-    """Sends an HTML message with pe(), falling back to plain text if Telegram rejects an emoji/tag."""
+    """Sends HTML with pe(); if an emoji ID is invalid, preserves HTML and drops only <tg-emoji>."""
+    rendered = pe(html_text)
     try:
-        return await update.message.reply_text(pe(html_text), parse_mode="HTML", **kwargs)
+        return await update.message.reply_text(rendered, parse_mode="HTML", **kwargs)
     except BadRequest as e:
-        logger.warning(f"HTML/Emoji parse error in reply ({e}) — sending plain fallback.")
-        return await update.message.reply_text(strip_html_tags(html_text), **kwargs)
+        logger.warning(f"Telegram BadRequest in reply ({e}) — retrying without <tg-emoji>.")
+        try:
+            return await update.message.reply_text(strip_tg_emoji_only(rendered), parse_mode="HTML", **kwargs)
+        except BadRequest as e2:
+            logger.error(f"HTML parse error in reply ({e2}) — falling back to plain text.")
+            return await update.message.reply_text(strip_html_tags(rendered), **kwargs)
 
 async def safe_edit(message, html_text: str, **kwargs):
-    """Edits an HTML message with pe(), falling back to plain text on BadRequest and ignoring TimedOut."""
+    """Edits HTML with pe(); if an emoji ID is invalid, preserves HTML and drops only <tg-emoji>."""
+    rendered = pe(html_text)
     try:
-        return await message.edit_text(pe(html_text), parse_mode="HTML", **kwargs)
+        return await message.edit_text(rendered, parse_mode="HTML", **kwargs)
     except BadRequest as e:
         if "message is not modified" in str(e).lower():
             return message
-        logger.warning(f"HTML/Emoji parse error in edit ({e}) — sending plain fallback.")
+        logger.warning(f"Telegram BadRequest in edit ({e}) — retrying without <tg-emoji>.")
         try:
-            return await message.edit_text(strip_html_tags(html_text), **kwargs)
-        except Exception:
-            return message
+            return await message.edit_text(strip_tg_emoji_only(rendered), parse_mode="HTML", **kwargs)
+        except BadRequest as e2:
+            logger.error(f"HTML parse error in edit ({e2}) — falling back to plain text.")
+            try:
+                return await message.edit_text(strip_html_tags(rendered), **kwargs)
+            except Exception:
+                return message
     except TimedOut:
         logger.warning("Telegram TimedOut during message edit — continuing.")
         return message
@@ -503,18 +527,20 @@ def build_single_card(acct: dict) -> tuple[str, InlineKeyboardMarkup]:
         f"<b>🔱 XERON</b>"
     )
 
-    pc_btn_kwargs = {"icon_custom_emoji_id": BTN_EMOJI_PC} if BTN_EMOJI_PC else {}
-    phone_btn_kwargs = {"icon_custom_emoji_id": BTN_EMOJI_PHONE} if BTN_EMOJI_PHONE else {}
+    clean_pc = (BTN_EMOJI_PC or "").strip()
+    clean_phone = (BTN_EMOJI_PHONE or "").strip()
+    pc_btn_kwargs = {"icon_custom_emoji_id": clean_pc} if clean_pc else {}
+    phone_btn_kwargs = {"icon_custom_emoji_id": clean_phone} if clean_phone else {}
 
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
-                "PC Login" if BTN_EMOJI_PC else "💻 PC Login",
+                "PC Login" if clean_pc else "💻 PC Login",
                 url=acct["pc_link"],
                 **pc_btn_kwargs,
             ),
             InlineKeyboardButton(
-                "Phone Login" if BTN_EMOJI_PHONE else "📱 Phone Login",
+                "Phone Login" if clean_phone else "📱 Phone Login",
                 url=acct["phone_link"],
                 **phone_btn_kwargs,
             ),
@@ -569,18 +595,27 @@ async def send_results(
         pass
 
     caption_html = f"{header}\nValid: <b>{len(valid_accounts)}</b> / {total_checked}"
+    rendered_caption = pe(caption_html)
     try:
         await update.message.reply_document(
             document=bio,
-            caption=pe(caption_html),
+            caption=rendered_caption,
             parse_mode="HTML",
         )
     except BadRequest:
         bio.seek(0)
-        await update.message.reply_document(
-            document=bio,
-            caption=strip_html_tags(caption_html),
-        )
+        try:
+            await update.message.reply_document(
+                document=bio,
+                caption=strip_tg_emoji_only(rendered_caption),
+                parse_mode="HTML",
+            )
+        except BadRequest:
+            bio.seek(0)
+            await update.message.reply_document(
+                document=bio,
+                caption=strip_html_tags(rendered_caption),
+            )
 
 # ========== SHARED REDEEM PROCESSOR ==========
 async def process_redeem_code(update: Update, raw_code: str):
@@ -673,7 +708,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Upload a single <code>.txt</code> or bulk <code>.zip</code> archive"
     )
     await safe_reply(update, help_text)
-    
+
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id in ACTIVE_CHECKS:
