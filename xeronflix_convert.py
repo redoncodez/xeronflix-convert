@@ -15,6 +15,7 @@ import psycopg2
 from urllib.parse import unquote
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from telegram.error import BadRequest, TimedOut
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -76,12 +77,42 @@ PREMIUM_EMOJI_MAP = {
 
 BTN_EMOJI_PC = "5235785929502761186"     # Paste custom_emoji_id for 💻 here
 BTN_EMOJI_PHONE = "6026092115631543342"  # Paste custom_emoji_id for 📱 here
+
 def pe(text: str) -> str:
     """Automatically converts every mapped standard emoji in an HTML string into a <tg-emoji> tag."""
     for std_emoji, custom_id in PREMIUM_EMOJI_MAP.items():
         if custom_id:
             text = text.replace(std_emoji, f'<tg-emoji emoji-id="{custom_id}">{std_emoji}</tg-emoji>')
     return text
+
+# ========== SAFE SEND / EDIT HELPERS (HTML & TIMEOUT RESILIENT) ==========
+def strip_html_tags(text: str) -> str:
+    clean = re.sub(r"<[^>]+>", "", text)
+    return html.unescape(clean)
+
+async def safe_reply(update: Update, html_text: str, **kwargs):
+    """Sends an HTML message with pe(), falling back to plain text if Telegram rejects an emoji/tag."""
+    try:
+        return await update.message.reply_text(pe(html_text), parse_mode="HTML", **kwargs)
+    except BadRequest as e:
+        logger.warning(f"HTML/Emoji parse error in reply ({e}) — sending plain fallback.")
+        return await update.message.reply_text(strip_html_tags(html_text), **kwargs)
+
+async def safe_edit(message, html_text: str, **kwargs):
+    """Edits an HTML message with pe(), falling back to plain text on BadRequest and ignoring TimedOut."""
+    try:
+        return await message.edit_text(pe(html_text), parse_mode="HTML", **kwargs)
+    except BadRequest as e:
+        if "message is not modified" in str(e).lower():
+            return message
+        logger.warning(f"HTML/Emoji parse error in edit ({e}) — sending plain fallback.")
+        try:
+            return await message.edit_text(strip_html_tags(html_text), **kwargs)
+        except Exception:
+            return message
+    except TimedOut:
+        logger.warning("Telegram TimedOut during message edit — continuing.")
+        return message
 
 # ========== ACTIVE CHECK TRACKING (/stop) ==========
 ACTIVE_CHECKS = set()   # user_ids currently running a batch check
@@ -454,7 +485,7 @@ def build_login_links_fallback(cookie_dict: dict, source_label: str) -> dict | N
 
 # ========== OUTPUT CARD & BULK REPORT BUILDER ==========
 def build_single_card(acct: dict) -> tuple[str, InlineKeyboardMarkup]:
-    card_text = pe(
+    card_text = (
         f"📁 <b>Source:</b> <code>{html.escape(acct['source'])}</code>\n"
         f"✅ <b>Status:</b> Valid Account\n\n"
         f"🎬 <b>Plan:</b> {html.escape(acct['plan'])}\n"
@@ -492,18 +523,18 @@ async def send_results(
     stop_banner = "🛑 <b>Check Stopped Early!</b>\n" if was_stopped else ""
 
     if not valid_accounts:
-        await status_msg.edit_text(
-            pe(f"{stop_banner}❌ <b>No Valid Accounts Found</b>\nChecked: {total_checked} cookie(s)."),
-            parse_mode="HTML",
+        await safe_edit(
+            status_msg,
+            f"{stop_banner}❌ <b>No Valid Accounts Found</b>\nChecked: {total_checked} cookie(s).",
         )
         return
 
     if len(valid_accounts) == 1:
         card_text, keyboard = build_single_card(valid_accounts[0])
-        await status_msg.edit_text(
-            pe(stop_banner) + card_text,
+        await safe_edit(
+            status_msg,
+            stop_banner + card_text,
             reply_markup=keyboard,
-            parse_mode="HTML",
             disable_web_page_preview=True,
         )
         return
@@ -523,35 +554,39 @@ async def send_results(
     bio.name = f"results_{int(time.time())}.txt"
 
     header = "🛑 <b>Check Stopped!</b>" if was_stopped else "✅ <b>Bulk Check Complete!</b>"
-    await status_msg.delete()
-    await update.message.reply_document(
-        document=bio,
-        caption=pe(
-            f"{header}\n"
-            f"Valid: <b>{len(valid_accounts)}</b> / {total_checked}"
-        ),
-        parse_mode="HTML",
-    )
+    try:
+        await status_msg.delete()
+    except Exception:
+        pass
+
+    caption_html = f"{header}\nValid: <b>{len(valid_accounts)}</b> / {total_checked}"
+    try:
+        await update.message.reply_document(
+            document=bio,
+            caption=pe(caption_html),
+            parse_mode="HTML",
+        )
+    except BadRequest:
+        bio.seek(0)
+        await update.message.reply_document(
+            document=bio,
+            caption=strip_html_tags(caption_html),
+        )
 
 # ========== SHARED REDEEM PROCESSOR ==========
 async def process_redeem_code(update: Update, raw_code: str):
     user_id = update.effective_user.id
     norm_code = normalize_code(raw_code)
-    status_msg = await update.message.reply_text(
-        pe("🔄 Verifying code..."),
-        parse_mode="HTML",
-    )
+    status_msg = await safe_reply(update, "🔄 Verifying code...")
 
     local_hours = db_burn_promo_key(norm_code)
     if local_hours is not None:
         exp_time = time.time() + (local_hours * 3600)
         db_set_temp_access(user_id, exp_time)
-        await status_msg.edit_text(
-            pe(
-                f"🎉 <b>Promo Key Redeemed!</b>\n\n"
-                f"Granted <b>{local_hours}-Hour Checker Access</b> to your account (<code>{user_id}</code>)."
-            ),
-            parse_mode="HTML",
+        await safe_edit(
+            status_msg,
+            f"🎉 <b>Promo Key Redeemed!</b>\n\n"
+            f"Granted <b>{local_hours}-Hour Checker Access</b> to your account (<code>{user_id}</code>).",
         )
         return
 
@@ -559,7 +594,7 @@ async def process_redeem_code(update: Update, raw_code: str):
 
     if not result.get("ok"):
         err_msg = failure_text(result.get("error", "unknown"))
-        await status_msg.edit_text(pe(f"❌ {err_msg}"), parse_mode="HTML")
+        await safe_edit(status_msg, f"❌ {err_msg}")
         return
 
     raw_cookie = result.get("cookie", "")
@@ -567,16 +602,10 @@ async def process_redeem_code(update: Update, raw_code: str):
     cookies = parse_cookies_from_text(raw_cookie)
 
     if not cookies or "NetflixId" not in cookies:
-        await status_msg.edit_text(
-            pe(f"❌ {failure_text('cookie_missing')}"),
-            parse_mode="HTML",
-        )
+        await safe_edit(status_msg, f"❌ {failure_text('cookie_missing')}")
         return
 
-    await status_msg.edit_text(
-        pe("🔄 Order verified! Preparing your login links..."),
-        parse_mode="HTML",
-    )
+    await safe_edit(status_msg, "🔄 Order verified! Preparing your login links...")
 
     acct = await asyncio.to_thread(check_netflix_cookie, cookies)
     if acct:
@@ -585,10 +614,10 @@ async def process_redeem_code(update: Update, raw_code: str):
         acct = build_login_links_fallback(cookies, f"Order {order_code}")
 
     card_text, keyboard = build_single_card(acct)
-    await status_msg.edit_text(
-        pe("🎉 <b>Order Redeemed Successfully!</b>\n\n") + card_text,
+    await safe_edit(
+        status_msg,
+        "🎉 <b>Order Redeemed Successfully!</b>\n\n" + card_text,
         reply_markup=keyboard,
-        parse_mode="HTML",
         disable_web_page_preview=True,
     )
 
@@ -602,24 +631,24 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else "🔒 <b>Checker Mode:</b> Locked (Redeem a key or order code)"
     )
 
-    welcome_text = pe(
-        f"🎬 <b>Xeronflix Cookie Checker</b>\n\n"
+    welcome_text = (
+        f"🎬 <b>Xeronflix Cookie Checker &amp; Order Redeemer</b>\n\n"
         f"{status_line}\n"
         f"🆔 <b>Your ID:</b> <code>{user_id}</code>\n\n"
         f"<b>Quick Start:</b>\n"
-        f"• Redeem order or promo key: <code>/redeem <code></code>\n"
+        f"• Redeem order or promo key: <code>/redeem &lt;code&gt;</code>\n"
         f"• View all commands: <code>/help</code>"
     )
-    await update.message.reply_text(welcome_text, parse_mode="HTML")
+    await safe_reply(update, welcome_text)
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     help_text = (
-        f"📖 <b>Xeronflix Bot Commands & Guide</b>\n\n"
+        f"📖 <b>Xeronflix Bot Commands &amp; Guide</b>\n\n"
         f"<b>User Commands:</b>\n"
-        f"• <code>/start</code> — Check your access status & Telegram ID\n"
+        f"• <code>/start</code> — Check your access status &amp; Telegram ID\n"
         f"• <code>/help</code> — Show this command menu\n"
-        f"• <code>/redeem <code></code> — Redeem a Xerodel order code or promo key\n"
+        f"• <code>/redeem &lt;code&gt;</code> — Redeem a Xerodel order code or promo key\n"
         f"• <code>/stop</code> — Instantly stop an ongoing ZIP/batch check\n\n"
         f"<b>Cookie Checking (Authorized Users):</b>\n"
         f"• Paste raw Netflix cookies (JSON, Netscape, or Header format)\n"
@@ -630,35 +659,26 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         proxy_status = html.escape(get_active_proxy()) if get_active_proxy() else "None (Direct)"
         help_text += (
             f"\n\n🔑 <b>Owner Admin Commands:</b>\n"
-            f"• <code>/approve <user_id></code> — Grant permanent access\n"
-            f"• <code>/revoke <user_id></code> — Remove user access\n"
+            f"• <code>/approve &lt;user_id&gt;</code> — Grant permanent access\n"
+            f"• <code>/revoke &lt;user_id&gt;</code> — Remove user access\n"
             f"• <code>/genkey [hours]</code> — Generate a one-time promo key (default 24h)\n"
-            f"• <code>/addproxy <url></code> — Set global HTTP proxy (<code>off</code> to clear)\n"
+            f"• <code>/addproxy &lt;url&gt;</code> — Set global HTTP proxy (<code>off</code> to clear)\n"
             f"🌍 <b>Current Proxy:</b> <code>{proxy_status}</code>"
         )
 
-    await update.message.reply_text(pe(help_text), parse_mode="HTML")
+    await safe_reply(update, help_text)
 
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id in ACTIVE_CHECKS:
         STOP_REQUESTED.add(user_id)
-        await update.message.reply_text(
-            pe("🛑 Stopping current check immediately..."),
-            parse_mode="HTML",
-        )
+        await safe_reply(update, "🛑 Stopping current check immediately...")
     else:
-        await update.message.reply_text(
-            pe("⚠️ You have no active check running right now."),
-            parse_mode="HTML",
-        )
+        await safe_reply(update, "⚠️ You have no active check running right now.")
 
 async def redeem_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text(
-            pe(f"⚠️ {failure_text('code_required')}"),
-            parse_mode="HTML",
-        )
+        await safe_reply(update, f"⚠️ {failure_text('code_required')}")
         return
     await process_redeem_code(update, context.args[0])
 
@@ -666,27 +686,21 @@ async def approve_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return
     if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text(
-            pe("⚠️ Usage: <code>/approve <user_id></code>"),
-            parse_mode="HTML",
-        )
+        await safe_reply(update, "⚠️ Usage: <code>/approve &lt;user_id&gt;</code>")
         return
     target_id = int(context.args[0])
     db_add_approved(target_id)
-    await update.message.reply_text(pe(f"✅ Approved user <code>{target_id}</code>."), parse_mode="HTML")
+    await safe_reply(update, f"✅ Approved user <code>{target_id}</code>.")
 
 async def revoke_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return
     if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text(
-            pe("⚠️ Usage: <code>/revoke <user_id></code>"),
-            parse_mode="HTML",
-        )
+        await safe_reply(update, "⚠️ Usage: <code>/revoke &lt;user_id&gt;</code>")
         return
     target_id = int(context.args[0])
     db_remove_approved(target_id)
-    await update.message.reply_text(pe(f"🚫 Revoked access for <code>{target_id}</code>."), parse_mode="HTML")
+    await safe_reply(update, f"🚫 Revoked access for <code>{target_id}</code>.")
 
 async def genkey_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
@@ -698,14 +712,12 @@ async def genkey_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     key_code = f"KEY-{secrets.token_hex(4).upper()}"
     db_create_promo_key(key_code, hours)
 
-    await update.message.reply_text(
-        pe(
-            f"🔑 <b>Promo Key Generated!</b>\n\n"
-            f"• <b>Key:</b> <code>{key_code}</code>\n"
-            f"• <b>Duration:</b> {hours} Hour(s)\n\n"
-            f"User can claim it with:\n<code>/redeem {key_code}</code>"
-        ),
-        parse_mode="HTML",
+    await safe_reply(
+        update,
+        f"🔑 <b>Promo Key Generated!</b>\n\n"
+        f"• <b>Key:</b> <code>{key_code}</code>\n"
+        f"• <b>Duration:</b> {hours} Hour(s)\n\n"
+        f"User can claim it with:\n<code>/redeem {key_code}</code>",
     )
 
 async def addproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -713,32 +725,27 @@ async def addproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if not context.args:
         current = html.escape(get_active_proxy()) if get_active_proxy() else "None"
-        await update.message.reply_text(
-            pe(
-                f"🌍 <b>Global Proxy Settings</b>\n"
-                f"• <b>Active:</b> <code>{current}</code>\n\n"
-                f"<b>Usage:</b>\n"
-                f"• Set: <code>/addproxy http://user:pass@ip:port</code>\n"
-                f"• Clear: <code>/addproxy off</code>"
-            ),
-            parse_mode="HTML",
+        await safe_reply(
+            update,
+            f"🌍 <b>Global Proxy Settings</b>\n"
+            f"• <b>Active:</b> <code>{current}</code>\n\n"
+            f"<b>Usage:</b>\n"
+            f"• Set: <code>/addproxy http://user:pass@ip:port</code>\n"
+            f"• Clear: <code>/addproxy off</code>",
         )
         return
 
     val = context.args[0].strip()
     if val.lower() in ("off", "none", "clear", "remove", "delete"):
         db_set_proxy("")
-        await update.message.reply_text(pe("✅ Global proxy cleared. Bot will use direct connection."), parse_mode="HTML")
+        await safe_reply(update, "✅ Global proxy cleared. Bot will use direct connection.")
         return
 
     if not (val.startswith("http://") or val.startswith("https://") or val.startswith("socks5://")):
         val = f"http://{val}"
 
     db_set_proxy(val)
-    await update.message.reply_text(
-        pe(f"✅ <b>Global Proxy Updated!</b>\n<code>{html.escape(val)}</code>"),
-        parse_mode="HTML",
-    )
+    await safe_reply(update, f"✅ <b>Global Proxy Updated!</b>\n<code>{html.escape(val)}</code>")
 
 # ========== TEXT & FILE HANDLERS ==========
 CODE_PATTERN = re.compile(r"^(XERO|KEY)-[A-Z0-9]{4,12}(-[A-Z0-9]{4})?$", re.IGNORECASE)
@@ -752,21 +759,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_id = update.effective_user.id
     if not db_is_authorized(user_id):
-        await update.message.reply_text(
-            pe("🔒 You are not authorized. Redeem a code with <code>/redeem <code></code> or check <code>/help</code>."),
-            parse_mode="HTML",
+        await safe_reply(
+            update,
+            "🔒 You are not authorized. Redeem a code with <code>/redeem &lt;code&gt;</code> or check <code>/help</code>.",
         )
         return
 
     cookies = parse_cookies_from_text(raw_text)
     if not cookies or "NetflixId" not in cookies:
-        await update.message.reply_text(
-            pe("⚠️ No valid <code>NetflixId</code> cookie or redeem code detected."),
-            parse_mode="HTML",
-        )
+        await safe_reply(update, "⚠️ No valid <code>NetflixId</code> cookie or redeem code detected.")
         return
 
-    status_msg = await update.message.reply_text(pe("🔄 Checking Netflix cookie..."), parse_mode="HTML")
+    status_msg = await safe_reply(update, "🔄 Checking Netflix cookie...")
     res = await asyncio.to_thread(check_netflix_cookie, cookies)
     valid = []
     if res:
@@ -778,16 +782,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not db_is_authorized(user_id):
-        await update.message.reply_text(
-            pe("🔒 File checking is restricted to approved users. Use <code>/redeem <code></code> first."),
-            parse_mode="HTML",
+        await safe_reply(
+            update,
+            "🔒 File checking is restricted to approved users. Use <code>/redeem &lt;code&gt;</code> first.",
         )
         return
 
     if user_id in ACTIVE_CHECKS:
-        await update.message.reply_text(
-            pe("⚠️ You already have a check running! Send <code>/stop</code> first to cancel it."),
-            parse_mode="HTML",
+        await safe_reply(
+            update,
+            "⚠️ You already have a check running! Send <code>/stop</code> first to cancel it.",
         )
         return
 
@@ -796,18 +800,20 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lower_name = filename.lower()
 
     if not (lower_name.endswith(".txt") or lower_name.endswith(".zip")):
-        await update.message.reply_text(
-            pe("⚠️ Please upload only <code>.txt</code> or <code>.zip</code> files."),
-            parse_mode="HTML",
-        )
+        await safe_reply(update, "⚠️ Please upload only <code>.txt</code> or <code>.zip</code> files.")
         return
 
-    status_msg = await update.message.reply_text(
-        pe(f"🔄 Processing <code>{html.escape(filename)}</code>... (Send <code>/stop</code> to cancel)"),
-        parse_mode="HTML",
+    status_msg = await safe_reply(
+        update,
+        f"🔄 Downloading <code>{html.escape(filename)}</code>... (Send <code>/stop</code> to cancel)",
     )
-    tg_file = await doc.get_file()
-    file_bytes = await tg_file.download_as_bytearray()
+
+    try:
+        tg_file = await doc.get_file(read_timeout=30.0, write_timeout=30.0, connect_timeout=30.0)
+        file_bytes = await tg_file.download_as_bytearray(read_timeout=30.0, write_timeout=30.0, connect_timeout=30.0)
+    except TimedOut:
+        await safe_edit(status_msg, "❌ Telegram timed out downloading your file. Please try again.")
+        return
 
     entries = []
     if lower_name.endswith(".txt"):
@@ -820,10 +826,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         content = zf.read(member).decode("utf-8", errors="ignore")
                         entries.append((os.path.basename(member), content))
         except Exception as e:
-            await status_msg.edit_text(
-                pe(f"❌ Failed to read ZIP archive: {html.escape(str(e))}"),
-                parse_mode="HTML",
-            )
+            await safe_edit(status_msg, f"❌ Failed to read ZIP archive: {html.escape(str(e))}")
             return
 
     valid_accounts = []
@@ -843,19 +846,14 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cookies = parse_cookies_from_text(content)
             if cookies and "NetflixId" in cookies:
                 checked_count += 1
-                # Update live progress every 5 files so user sees progress and can /stop
-                if checked_count == 1 or checked_count % 5 == 0:
-                    try:
-                        await status_msg.edit_text(
-                            pe(
-                                f"🔄 Checking <code>{html.escape(filename)}</code>...\n"
-                                f"Progress: <b>{idx}/{total_entries}</b> | Valid: <b>{len(valid_accounts)}</b>\n"
-                                f"Send <code>/stop</code> to cancel anytime."
-                            ),
-                            parse_mode="HTML",
-                        )
-                    except Exception:
-                        pass
+                # Throttled progress update every 15 files to avoid Telegram TimedOut/Flood
+                if checked_count == 1 or checked_count % 15 == 0:
+                    await safe_edit(
+                        status_msg,
+                        f"🔄 Checking <code>{html.escape(filename)}</code>...\n"
+                        f"Progress: <b>{idx}/{total_entries}</b> | Valid: <b>{len(valid_accounts)}</b>\n"
+                        f"Send <code>/stop</code> to cancel anytime.",
+                    )
 
                 res = await asyncio.to_thread(check_netflix_cookie, cookies)
                 if res:
@@ -902,11 +900,14 @@ def main():
     init_db()
     threading.Thread(target=run_flask, daemon=True).start()
 
-    # concurrent_updates=True allows /stop to be handled while handle_document is running!
     app = (
         Application.builder()
         .token(BOT_TOKEN)
         .concurrent_updates(True)
+        .connect_timeout(30.0)
+        .read_timeout(30.0)
+        .write_timeout(30.0)
+        .pool_timeout(30.0)
         .post_init(post_init)
         .build()
     )
