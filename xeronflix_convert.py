@@ -4,6 +4,8 @@ import io
 import json
 import time
 import html
+import asyncio
+import secrets
 import zipfile
 import logging
 import threading
@@ -12,7 +14,7 @@ import httpx
 import psycopg2
 from urllib.parse import unquote
 from flask import Flask
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -35,7 +37,7 @@ PORT = int(os.environ.get("PORT", "8000"))
 
 SUPABASE_URI = os.environ.get("SUPABASE_URI", "")
 
-# Xerodel Redeem Service Config (supports both COOKIE_BOT_API_KEY and REDEEM_API_KEY)
+# Xerodel Redeem Service Config
 REDEEM_API_KEY = (
     os.environ.get("COOKIE_BOT_API_KEY")
     or os.environ.get("REDEEM_API_KEY")
@@ -49,12 +51,10 @@ REDEEM_BASE_URL = (
 VERIFY_PATH = "/api/redeem/verify"
 REDEEM_TIMEOUT = 20
 
-# Optional Global HTTP Proxy (format: http://user:pass@host:port)
+# Default Global HTTP Proxy (can be updated live via /addproxy)
 GLOBAL_PROXY = os.environ.get("GLOBAL_PROXY", "")
 
 # ========== MASTER TELEGRAM PREMIUM EMOJI MAP ==========
-# Paste your copied custom_emoji_id strings next to each standard emoji.
-# Any entry left as "" will automatically display its normal emoji fallback.
 PREMIUM_EMOJI_MAP = {
     "📁": "5431420628978641216",  # Source / Order tag
     "✅": "5980930633298350051",  # Valid / Success
@@ -69,18 +69,23 @@ PREMIUM_EMOJI_MAP = {
     "📅": "6014861794059752708",  # Expiry
     "🎉": "6023832365833392885",  # Promo / Order Claimed
     "🚫": "6032903688949862892",  # Revoked
+    "🔑": "6026218958900695642",  # Promo Key
+    "📖": "6181322172263308706",  # Help
+    "🛑": "6181277564732972292",  # Stopped
 }
 
-# Custom Emoji IDs for Inline Keyboard Buttons (PC Login / Phone Login)
 BTN_EMOJI_PC = "5235785929502761186"     # Paste custom_emoji_id for 💻 here
 BTN_EMOJI_PHONE = "6026092115631543342"  # Paste custom_emoji_id for 📱 here
-
 def pe(text: str) -> str:
     """Automatically converts every mapped standard emoji in an HTML string into a <tg-emoji> tag."""
     for std_emoji, custom_id in PREMIUM_EMOJI_MAP.items():
         if custom_id:
             text = text.replace(std_emoji, f'<tg-emoji emoji-id="{custom_id}">{std_emoji}</tg-emoji>')
     return text
+
+# ========== ACTIVE CHECK TRACKING (/stop) ==========
+ACTIVE_CHECKS = set()   # user_ids currently running a batch check
+STOP_REQUESTED = set()  # user_ids that triggered /stop
 
 # ========== XERODEL REDEEM API & ERROR MESSAGES ==========
 FAILURE_TEXT = {
@@ -100,7 +105,6 @@ def failure_text(error: str) -> str:
     return FAILURE_TEXT.get(error, f"Redeem failed ({html.escape(str(error))}) — please contact support.")
 
 async def verify_redeem_code(code: str, telegram_id: int) -> dict:
-    """Verifies a redeem code and returns {"ok": True, "cookie": "...", ...} or {"ok": False, "error": "..."}."""
     code = normalize_code(code)
     if not code:
         return {"ok": False, "error": "code_required"}
@@ -143,6 +147,9 @@ async def verify_redeem_code(code: str, telegram_id: int) -> dict:
 
 # ========== IN-MEMORY FALLBACK & SUPABASE STORAGE ==========
 MEM_APPROVED_USERS = {OWNER_ID}
+MEM_TEMP_USERS = {}    # {user_id: expires_at}
+MEM_PROMO_KEYS = {}    # {key_code: duration_hours}
+MEM_SETTINGS = {"global_proxy": GLOBAL_PROXY}
 
 def get_db_conn():
     if not SUPABASE_URI:
@@ -162,27 +169,82 @@ def init_db():
                         user_id BIGINT PRIMARY KEY
                     );
                 """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS temp_users (
+                        user_id BIGINT PRIMARY KEY,
+                        expires_at DOUBLE PRECISION NOT NULL
+                    );
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS promo_keys (
+                        key_code TEXT PRIMARY KEY,
+                        duration_hours INTEGER NOT NULL DEFAULT 24
+                    );
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS bot_settings (
+                        setting_key TEXT PRIMARY KEY,
+                        setting_value TEXT NOT NULL
+                    );
+                """)
                 cur.execute(
                     "INSERT INTO approved_users (user_id) VALUES (%s) ON CONFLICT DO NOTHING;",
                     (OWNER_ID,),
                 )
+                cur.execute("SELECT setting_value FROM bot_settings WHERE setting_key = 'global_proxy';")
+                row = cur.fetchone()
+                if row:
+                    MEM_SETTINGS["global_proxy"] = row[0]
         conn.close()
         logger.info("✅ Supabase tables initialized successfully!")
     except Exception as e:
         logger.error(f"❌ Supabase initialization failed: {e}")
 
+def get_active_proxy() -> str:
+    return (MEM_SETTINGS.get("global_proxy") or "").strip()
+
+def db_set_proxy(proxy_url: str):
+    MEM_SETTINGS["global_proxy"] = proxy_url.strip()
+    if not SUPABASE_URI:
+        return
+    try:
+        conn = get_db_conn()
+        with conn:
+            with conn.cursor() as cur:
+                if proxy_url.strip():
+                    cur.execute(
+                        """
+                        INSERT INTO bot_settings (setting_key, setting_value)
+                        VALUES ('global_proxy', %s)
+                        ON CONFLICT (setting_key) DO UPDATE SET setting_value = EXCLUDED.setting_value;
+                        """,
+                        (proxy_url.strip(),),
+                    )
+                else:
+                    cur.execute("DELETE FROM bot_settings WHERE setting_key = 'global_proxy';")
+        conn.close()
+    except Exception as e:
+        logger.error(f"DB set proxy error: {e}")
+
 def db_is_authorized(user_id: int) -> bool:
     if user_id == OWNER_ID:
         return True
     if not SUPABASE_URI:
-        return user_id in MEM_APPROVED_USERS
+        if user_id in MEM_APPROVED_USERS:
+            return True
+        return MEM_TEMP_USERS.get(user_id, 0) > time.time()
     try:
         conn = get_db_conn()
         with conn.cursor() as cur:
             cur.execute("SELECT 1 FROM approved_users WHERE user_id = %s;", (user_id,))
-            found = cur.fetchone() is not None
-        conn.close()
-        return found
+            if cur.fetchone():
+                conn.close()
+                return True
+            cur.execute("SELECT expires_at FROM temp_users WHERE user_id = %s;", (user_id,))
+            row = cur.fetchone()
+            conn.close()
+            if row and row[0] > time.time():
+                return True
     except Exception as e:
         logger.error(f"DB auth check error: {e}")
     return False
@@ -205,6 +267,7 @@ def db_add_approved(user_id: int):
 
 def db_remove_approved(user_id: int):
     MEM_APPROVED_USERS.discard(user_id)
+    MEM_TEMP_USERS.pop(user_id, None)
     if not SUPABASE_URI:
         return
     try:
@@ -212,9 +275,65 @@ def db_remove_approved(user_id: int):
         with conn:
             with conn.cursor() as cur:
                 cur.execute("DELETE FROM approved_users WHERE user_id = %s;", (user_id,))
+                cur.execute("DELETE FROM temp_users WHERE user_id = %s;", (user_id,))
         conn.close()
     except Exception as e:
         logger.error(f"DB remove approved error: {e}")
+
+def db_set_temp_access(user_id: int, expires_at: float):
+    MEM_TEMP_USERS[user_id] = expires_at
+    if not SUPABASE_URI:
+        return
+    try:
+        conn = get_db_conn()
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO temp_users (user_id, expires_at)
+                    VALUES (%s, %s)
+                    ON CONFLICT (user_id) DO UPDATE SET expires_at = EXCLUDED.expires_at;
+                    """,
+                    (user_id, expires_at),
+                )
+        conn.close()
+    except Exception as e:
+        logger.error(f"DB set temp access error: {e}")
+
+def db_create_promo_key(key_code: str, hours: int):
+    MEM_PROMO_KEYS[key_code] = hours
+    if not SUPABASE_URI:
+        return
+    try:
+        conn = get_db_conn()
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO promo_keys (key_code, duration_hours) VALUES (%s, %s);",
+                    (key_code, hours),
+                )
+        conn.close()
+    except Exception as e:
+        logger.error(f"DB create promo key error: {e}")
+
+def db_burn_promo_key(key_code: str) -> int | None:
+    key_code = normalize_code(key_code)
+    if not SUPABASE_URI:
+        return MEM_PROMO_KEYS.pop(key_code, None)
+    try:
+        conn = get_db_conn()
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM promo_keys WHERE key_code = %s RETURNING duration_hours;",
+                    (key_code,),
+                )
+                row = cur.fetchone()
+        conn.close()
+        return row[0] if row else None
+    except Exception as e:
+        logger.error(f"DB burn promo key error: {e}")
+    return None
 
 # ========== COOKIE PARSING & NETFLIX CHECKER ==========
 def parse_cookies_from_text(raw_text: str) -> dict:
@@ -223,7 +342,6 @@ def parse_cookies_from_text(raw_text: str) -> dict:
     if not raw_text:
         return cookies
 
-    # 1. Try JSON format (Cookie-Editor / EditThisCookie)
     if raw_text.startswith("[") or raw_text.startswith("{"):
         try:
             data = json.loads(raw_text)
@@ -242,7 +360,6 @@ def parse_cookies_from_text(raw_text: str) -> dict:
         except Exception:
             pass
 
-    # 2. Try Netscape format or Header string (NetflixId=...; SecureNetflixId=...)
     for line in raw_text.splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
@@ -262,7 +379,8 @@ def check_netflix_cookie(cookie_dict: dict) -> dict | None:
     if not netflix_id:
         return None
 
-    proxies = {"http": GLOBAL_PROXY, "https": GLOBAL_PROXY} if GLOBAL_PROXY else None
+    proxy_url = get_active_proxy()
+    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -319,7 +437,6 @@ def check_netflix_cookie(cookie_dict: dict) -> dict | None:
         return None
 
 def build_login_links_fallback(cookie_dict: dict, source_label: str) -> dict | None:
-    """Fallback builder if NetflixId is present even if YourAccount scrape was rate-limited."""
     netflix_id = cookie_dict.get("NetflixId")
     if not netflix_id:
         return None
@@ -365,26 +482,32 @@ def build_single_card(acct: dict) -> tuple[str, InlineKeyboardMarkup]:
     ])
     return card_text, keyboard
 
-async def send_results(update: Update, status_msg, valid_accounts: list, total_checked: int):
+async def send_results(
+    update: Update,
+    status_msg,
+    valid_accounts: list,
+    total_checked: int,
+    was_stopped: bool = False,
+):
+    stop_banner = "🛑 <b>Check Stopped Early!</b>\n" if was_stopped else ""
+
     if not valid_accounts:
         await status_msg.edit_text(
-            pe(f"❌ <b>No Valid Accounts Found</b>\nChecked: {total_checked} cookie(s)."),
+            pe(f"{stop_banner}❌ <b>No Valid Accounts Found</b>\nChecked: {total_checked} cookie(s)."),
             parse_mode="HTML",
         )
         return
 
-    # Single valid account -> Send formatted Premium Emoji HTML Card with Login Buttons
     if len(valid_accounts) == 1:
         card_text, keyboard = build_single_card(valid_accounts[0])
         await status_msg.edit_text(
-            card_text,
+            pe(stop_banner) + card_text,
             reply_markup=keyboard,
             parse_mode="HTML",
             disable_web_page_preview=True,
         )
         return
 
-    # Multiple valid accounts (2+) -> Send downloadable TXT report
     lines = [f"=== XERONFLIX VALID ACCOUNTS ({len(valid_accounts)}/{total_checked}) ===\n"]
     for idx, acct in enumerate(valid_accounts, 1):
         lines.append(
@@ -399,11 +522,12 @@ async def send_results(update: Update, status_msg, valid_accounts: list, total_c
     bio = io.BytesIO(report_bytes)
     bio.name = f"results_{int(time.time())}.txt"
 
+    header = "🛑 <b>Check Stopped!</b>" if was_stopped else "✅ <b>Bulk Check Complete!</b>"
     await status_msg.delete()
     await update.message.reply_document(
         document=bio,
         caption=pe(
-            f"✅ <b>Bulk Check Complete!</b>\n"
+            f"{header}\n"
             f"Valid: <b>{len(valid_accounts)}</b> / {total_checked}"
         ),
         parse_mode="HTML",
@@ -412,12 +536,26 @@ async def send_results(update: Update, status_msg, valid_accounts: list, total_c
 # ========== SHARED REDEEM PROCESSOR ==========
 async def process_redeem_code(update: Update, raw_code: str):
     user_id = update.effective_user.id
+    norm_code = normalize_code(raw_code)
     status_msg = await update.message.reply_text(
-        pe("🔄 Verifying order code..."),
+        pe("🔄 Verifying code..."),
         parse_mode="HTML",
     )
 
-    result = await verify_redeem_code(raw_code, user_id)
+    local_hours = db_burn_promo_key(norm_code)
+    if local_hours is not None:
+        exp_time = time.time() + (local_hours * 3600)
+        db_set_temp_access(user_id, exp_time)
+        await status_msg.edit_text(
+            pe(
+                f"🎉 <b>Promo Key Redeemed!</b>\n\n"
+                f"Granted <b>{local_hours}-Hour Checker Access</b> to your account (<code>{user_id}</code>)."
+            ),
+            parse_mode="HTML",
+        )
+        return
+
+    result = await verify_redeem_code(norm_code, user_id)
 
     if not result.get("ok"):
         err_msg = failure_text(result.get("error", "unknown"))
@@ -425,7 +563,7 @@ async def process_redeem_code(update: Update, raw_code: str):
         return
 
     raw_cookie = result.get("cookie", "")
-    order_code = result.get("order_code") or normalize_code(raw_code)
+    order_code = result.get("order_code") or norm_code
     cookies = parse_cookies_from_text(raw_cookie)
 
     if not cookies or "NetflixId" not in cookies:
@@ -440,7 +578,7 @@ async def process_redeem_code(update: Update, raw_code: str):
         parse_mode="HTML",
     )
 
-    acct = check_netflix_cookie(cookies)
+    acct = await asyncio.to_thread(check_netflix_cookie, cookies)
     if acct:
         acct["source"] = f"Order {order_code}"
     else:
@@ -461,18 +599,59 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_line = (
         "✅ <b>Checker Mode:</b> Active"
         if auth
-        else "🔒 <b>Checker Mode:</b> Approved Users Only"
+        else "🔒 <b>Checker Mode:</b> Locked (Redeem a key or order code)"
     )
 
     welcome_text = pe(
         f"🎬 <b>Xeronflix Cookie Checker & Order Redeemer</b>\n\n"
         f"{status_line}\n"
         f"🆔 <b>Your ID:</b> <code>{user_id}</code>\n\n"
-        f"<b>How to use:</b>\n"
-        f"• Redeem an order code: <code>/redeem XERO-XXXX-XXXX</code> (or paste the code directly)\n"
-        f"• Approved users can also paste raw cookies or upload <code>.txt</code> / <code>.zip</code> files"
+        f"<b>Quick Start:</b>\n"
+        f"• Redeem order or promo key: <code>/redeem <code></code>\n"
+        f"• View all commands: <code>/help</code>"
     )
     await update.message.reply_text(welcome_text, parse_mode="HTML")
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    help_text = (
+        f"📖 <b>Xeronflix Bot Commands & Guide</b>\n\n"
+        f"<b>User Commands:</b>\n"
+        f"• <code>/start</code> — Check your access status & Telegram ID\n"
+        f"• <code>/help</code> — Show this command menu\n"
+        f"• <code>/redeem <code></code> — Redeem a Xerodel order code or promo key\n"
+        f"• <code>/stop</code> — Instantly stop an ongoing ZIP/batch check\n\n"
+        f"<b>Cookie Checking (Authorized Users):</b>\n"
+        f"• Paste raw Netflix cookies (JSON, Netscape, or Header format)\n"
+        f"• Upload a single <code>.txt</code> or bulk <code>.zip</code> archive"
+    )
+
+    if user_id == OWNER_ID:
+        proxy_status = html.escape(get_active_proxy()) if get_active_proxy() else "None (Direct)"
+        help_text += (
+            f"\n\n🔑 <b>Owner Admin Commands:</b>\n"
+            f"• <code>/approve <user_id></code> — Grant permanent access\n"
+            f"• <code>/revoke <user_id></code> — Remove user access\n"
+            f"• <code>/genkey [hours]</code> — Generate a one-time promo key (default 24h)\n"
+            f"• <code>/addproxy <url></code> — Set global HTTP proxy (<code>off</code> to clear)\n"
+            f"🌍 <b>Current Proxy:</b> <code>{proxy_status}</code>"
+        )
+
+    await update.message.reply_text(pe(help_text), parse_mode="HTML")
+
+async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id in ACTIVE_CHECKS:
+        STOP_REQUESTED.add(user_id)
+        await update.message.reply_text(
+            pe("🛑 Stopping current check immediately..."),
+            parse_mode="HTML",
+        )
+    else:
+        await update.message.reply_text(
+            pe("⚠️ You have no active check running right now."),
+            parse_mode="HTML",
+        )
 
 async def redeem_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -509,22 +688,72 @@ async def revoke_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db_remove_approved(target_id)
     await update.message.reply_text(pe(f"🚫 Revoked access for <code>{target_id}</code>."), parse_mode="HTML")
 
+async def genkey_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        return
+    hours = 24
+    if context.args and context.args[0].isdigit():
+        hours = max(1, int(context.args[0]))
+
+    key_code = f"KEY-{secrets.token_hex(4).upper()}"
+    db_create_promo_key(key_code, hours)
+
+    await update.message.reply_text(
+        pe(
+            f"🔑 <b>Promo Key Generated!</b>\n\n"
+            f"• <b>Key:</b> <code>{key_code}</code>\n"
+            f"• <b>Duration:</b> {hours} Hour(s)\n\n"
+            f"User can claim it with:\n<code>/redeem {key_code}</code>"
+        ),
+        parse_mode="HTML",
+    )
+
+async def addproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        return
+    if not context.args:
+        current = html.escape(get_active_proxy()) if get_active_proxy() else "None"
+        await update.message.reply_text(
+            pe(
+                f"🌍 <b>Global Proxy Settings</b>\n"
+                f"• <b>Active:</b> <code>{current}</code>\n\n"
+                f"<b>Usage:</b>\n"
+                f"• Set: <code>/addproxy http://user:pass@ip:port</code>\n"
+                f"• Clear: <code>/addproxy off</code>"
+            ),
+            parse_mode="HTML",
+        )
+        return
+
+    val = context.args[0].strip()
+    if val.lower() in ("off", "none", "clear", "remove", "delete"):
+        db_set_proxy("")
+        await update.message.reply_text(pe("✅ Global proxy cleared. Bot will use direct connection."), parse_mode="HTML")
+        return
+
+    if not (val.startswith("http://") or val.startswith("https://") or val.startswith("socks5://")):
+        val = f"http://{val}"
+
+    db_set_proxy(val)
+    await update.message.reply_text(
+        pe(f"✅ <b>Global Proxy Updated!</b>\n<code>{html.escape(val)}</code>"),
+        parse_mode="HTML",
+    )
+
 # ========== TEXT & FILE HANDLERS ==========
-CODE_PATTERN = re.compile(r"^XERO-[A-Z0-9]{4}-[A-Z0-9]{4}$", re.IGNORECASE)
+CODE_PATTERN = re.compile(r"^(XERO|KEY)-[A-Z0-9]{4,12}(-[A-Z0-9]{4})?$", re.IGNORECASE)
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw_text = (update.message.text or "").strip()
 
-    # 1. Anyone can paste a XERO-XXXX-XXXX order code directly without typing /redeem
     if CODE_PATTERN.match(raw_text):
         await process_redeem_code(update, raw_text)
         return
 
-    # 2. Raw cookie pasting is restricted to approved users
     user_id = update.effective_user.id
     if not db_is_authorized(user_id):
         await update.message.reply_text(
-            pe("🔒 Send your order code using <code>/redeem XERO-XXXX-XXXX</code>."),
+            pe("🔒 You are not authorized. Redeem a code with <code>/redeem <code></code> or check <code>/help</code>."),
             parse_mode="HTML",
         )
         return
@@ -532,13 +761,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cookies = parse_cookies_from_text(raw_text)
     if not cookies or "NetflixId" not in cookies:
         await update.message.reply_text(
-            pe("⚠️ No valid <code>NetflixId</code> cookie or <code>XERO-XXXX-XXXX</code> code detected."),
+            pe("⚠️ No valid <code>NetflixId</code> cookie or redeem code detected."),
             parse_mode="HTML",
         )
         return
 
     status_msg = await update.message.reply_text(pe("🔄 Checking Netflix cookie..."), parse_mode="HTML")
-    res = check_netflix_cookie(cookies)
+    res = await asyncio.to_thread(check_netflix_cookie, cookies)
     valid = []
     if res:
         res["source"] = "Direct Paste"
@@ -550,7 +779,14 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not db_is_authorized(user_id):
         await update.message.reply_text(
-            pe("🔒 File checking is restricted to approved users. Use <code>/redeem XERO-XXXX-XXXX</code> for order codes."),
+            pe("🔒 File checking is restricted to approved users. Use <code>/redeem <code></code> first."),
+            parse_mode="HTML",
+        )
+        return
+
+    if user_id in ACTIVE_CHECKS:
+        await update.message.reply_text(
+            pe("⚠️ You already have a check running! Send <code>/stop</code> first to cancel it."),
             parse_mode="HTML",
         )
         return
@@ -567,7 +803,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     status_msg = await update.message.reply_text(
-        pe(f"🔄 Processing <code>{html.escape(filename)}</code>..."),
+        pe(f"🔄 Processing <code>{html.escape(filename)}</code>... (Send <code>/stop</code> to cancel)"),
         parse_mode="HTML",
     )
     tg_file = await doc.get_file()
@@ -592,17 +828,61 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     valid_accounts = []
     checked_count = 0
+    was_stopped = False
 
-    for source_name, content in entries:
-        cookies = parse_cookies_from_text(content)
-        if cookies and "NetflixId" in cookies:
-            checked_count += 1
-            res = check_netflix_cookie(cookies)
-            if res:
-                res["source"] = source_name
-                valid_accounts.append(res)
+    ACTIVE_CHECKS.add(user_id)
+    STOP_REQUESTED.discard(user_id)
 
-    await send_results(update, status_msg, valid_accounts, checked_count)
+    try:
+        total_entries = len(entries)
+        for idx, (source_name, content) in enumerate(entries, 1):
+            if user_id in STOP_REQUESTED:
+                was_stopped = True
+                break
+
+            cookies = parse_cookies_from_text(content)
+            if cookies and "NetflixId" in cookies:
+                checked_count += 1
+                # Update live progress every 5 files so user sees progress and can /stop
+                if checked_count == 1 or checked_count % 5 == 0:
+                    try:
+                        await status_msg.edit_text(
+                            pe(
+                                f"🔄 Checking <code>{html.escape(filename)}</code>...\n"
+                                f"Progress: <b>{idx}/{total_entries}</b> | Valid: <b>{len(valid_accounts)}</b>\n"
+                                f"Send <code>/stop</code> to cancel anytime."
+                            ),
+                            parse_mode="HTML",
+                        )
+                    except Exception:
+                        pass
+
+                res = await asyncio.to_thread(check_netflix_cookie, cookies)
+                if res:
+                    res["source"] = source_name
+                    valid_accounts.append(res)
+
+                if user_id in STOP_REQUESTED:
+                    was_stopped = True
+                    break
+    finally:
+        ACTIVE_CHECKS.discard(user_id)
+        STOP_REQUESTED.discard(user_id)
+
+    await send_results(update, status_msg, valid_accounts, checked_count, was_stopped=was_stopped)
+
+# ========== TELEGRAM COMMAND MENU REGISTRATION ==========
+async def post_init(application: Application):
+    await application.bot.set_my_commands([
+        BotCommand("start", "Check bot status & your ID"),
+        BotCommand("help", "Show all commands & usage guide"),
+        BotCommand("redeem", "Redeem an order code or promo key"),
+        BotCommand("stop", "Stop an ongoing ZIP/batch check"),
+        BotCommand("approve", "Owner: Approve a user ID"),
+        BotCommand("revoke", "Owner: Revoke a user ID"),
+        BotCommand("genkey", "Owner: Generate a promo access key"),
+        BotCommand("addproxy", "Owner: Set or clear global HTTP proxy"),
+    ])
 
 # ========== FLASK HEALTH ENDPOINT ==========
 flask_app = Flask(__name__)
@@ -622,11 +902,22 @@ def main():
     init_db()
     threading.Thread(target=run_flask, daemon=True).start()
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    # concurrent_updates=True allows /stop to be handled while handle_document is running!
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .concurrent_updates(True)
+        .post_init(post_init)
+        .build()
+    )
     app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("redeem", redeem_command))
+    app.add_handler(CommandHandler("stop", stop_command))
     app.add_handler(CommandHandler("approve", approve_command))
     app.add_handler(CommandHandler("revoke", revoke_command))
+    app.add_handler(CommandHandler("genkey", genkey_command))
+    app.add_handler(CommandHandler("addproxy", addproxy_command))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
