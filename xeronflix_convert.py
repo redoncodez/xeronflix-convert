@@ -493,7 +493,7 @@ def build_single_card(acct: dict) -> tuple[str, InlineKeyboardMarkup]:
         f"🌍 <b>Country:</b> {html.escape(acct['country'])}\n"
         f"📅 <b>Expiry:</b> {html.escape(acct['expiry'])}\n"
         f"📧 <b>Email:</b> <code>{html.escape(acct['email'])}</code>\n\n"
-        f"<b> 🔱XERON</b>"
+        f"<b> 🔱 XERON</b>"
     )
 
     pc_btn_kwargs = {"icon_custom_emoji_id": BTN_EMOJI_PC} if BTN_EMOJI_PC else {}
