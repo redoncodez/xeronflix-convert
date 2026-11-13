@@ -579,8 +579,17 @@ async def send_results(
 async def process_redeem_code(update: Update, raw_code: str):
     user_id = update.effective_user.id
     norm_code = normalize_code(raw_code)
+
+    if not norm_code.startswith("XERO-"):
+        await safe_reply(
+            update,
+            "⚠️ Invalid format. Please enter a valid code: <code>/redeem XERO-XXXX-XXXX</code>",
+        )
+        return
+
     status_msg = await safe_reply(update, "🔄 Verifying code...")
 
+    # 1. Check local /genkey XERO- promo keys in Supabase first
     local_hours = db_burn_promo_key(norm_code)
     if local_hours is not None:
         exp_time = time.time() + (local_hours * 3600)
@@ -592,6 +601,7 @@ async def process_redeem_code(update: Update, raw_code: str):
         )
         return
 
+    # 2. Otherwise check Xerodel API for order session cookies
     result = await verify_redeem_code(norm_code, user_id)
 
     if not result.get("ok"):
@@ -711,7 +721,9 @@ async def genkey_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.args and context.args[0].isdigit():
         hours = max(1, int(context.args[0]))
 
-    key_code = f"KEY-{secrets.token_hex(4).upper()}"
+    part1 = secrets.token_hex(2).upper()
+    part2 = secrets.token_hex(2).upper()
+    key_code = f"XERO-{part1}-{part2}"
     db_create_promo_key(key_code, hours)
 
     await safe_reply(
