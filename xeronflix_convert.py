@@ -701,7 +701,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"<b>User Commands:</b>\n"
         f"• <code>/start</code> — Check your access status & Telegram ID\n"
         f"• <code>/help</code> — Show this command menu\n"
-        f"• <code>/redeem <code></code> — Redeem a Xerodel order code or promo key\n"
+        f"• <code>/redeem &lt;code&gt;</code> — Redeem a Xerodel order code or promo key\n"
         f"• <code>/stop</code> — Instantly stop an ongoing ZIP/batch check\n\n"
         f"<b>Cookie Checking (Authorized Users):</b>\n"
         f"• Paste raw Netflix cookies (JSON, Netscape, or Header format)\n"
@@ -727,7 +727,7 @@ async def approve_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return
     if not context.args or not context.args[0].isdigit():
-        await safe_reply(update, "⚠️ Usage: <code>/approve <user_id></code>")
+        await safe_reply(update, "⚠️ Usage: <code>/approve &lt;user_id&gt;</code>")
         return
     target_id = int(context.args[0])
     await asyncio.to_thread(db_add_approved, target_id)
@@ -737,7 +737,7 @@ async def revoke_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return
     if not context.args or not context.args[0].isdigit():
-        await safe_reply(update, "⚠️ Usage: <code>/revoke <user_id></code>")
+        await safe_reply(update, "⚠️ Usage: <code>/revoke &lt;user_id&gt;</code>")
         return
     target_id = int(context.args[0])
     await asyncio.to_thread(db_remove_approved, target_id)
