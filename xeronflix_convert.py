@@ -825,11 +825,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    is_private = update.effective_chat.type == "private"
     if not await asyncio.to_thread(db_is_authorized, user_id):
-        await safe_reply(
-            update,
-            "🔒 File checking is restricted to approved users. Use <code>/redeem XERO-XXXX-XXXX</code> first.",
-        )
+        if update.effective_chat.type == "private":
+            await safe_reply(
+                update,
+                "🔒 File checking is restricted to approved users. Use <code>/redeem XERO-XXXX-XXXX</code> first.",
+            )
         return
 
     if user_id in ACTIVE_CHECKS:
@@ -954,7 +956,7 @@ def main():
     app.add_handler(CommandHandler("genkey", genkey_command))
     app.add_handler(CommandHandler("addproxy", addproxy_command))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, handle_text))
 
     logger.info("🚀 Xeronflix Bot started polling...")
     app.run_polling(drop_pending_updates=True)
