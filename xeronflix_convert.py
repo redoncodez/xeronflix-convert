@@ -802,6 +802,22 @@ async def genkey_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"User can claim it with:\n<code>/redeem {key_code}</code>",
     )
 
+def normalize_proxy_url(raw: str) -> str | None:
+    raw = raw.strip()
+    if not raw:
+        return None
+    if raw.startswith(("http://", "https://", "socks5://", "socks5h://")):
+        return raw
+    parts = raw.split(":")
+    if len(parts) == 2:
+        host, port = parts
+        return f"http://{host}:{port}"
+    if len(parts) == 4:
+        host, port, user, password = parts
+        return f"http://{user}:{password}@{host}:{port}"
+    return None
+
+
 async def addproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return
@@ -813,6 +829,7 @@ async def addproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"• <b>Active:</b> <code>{current}</code>\n\n"
             f"<b>Usage:</b>\n"
             f"• Set: <code>/addproxy http://user:pass@ip:port</code>\n"
+            f"• Or: <code>/addproxy ip:port:user:pass</code>\n"
             f"• Clear: <code>/addproxy off</code>",
         )
         return
@@ -823,11 +840,44 @@ async def addproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_reply(update, "✅ Global proxy cleared. Bot will use direct connection.")
         return
 
-    if not (val.startswith("http://") or val.startswith("https://") or val.startswith("socks5://")):
-        val = f"http://{val}"
+    formatted_proxy = normalize_proxy_url(val)
+    if not formatted_proxy:
+        await safe_reply(
+            update,
+            "❌ <b>Invalid Proxy Format</b>\n"
+            "Use <code>ip:port</code>, <code>ip:port:user:pass</code>, or <code>http://user:pass@ip:port</code>.",
+        )
+        return
 
-    await asyncio.to_thread(db_set_proxy, val)
-    await safe_reply(update, f"✅ <b>Global Proxy Updated!</b>\n<code>{html.escape(val)}</code>")
+    status_msg = await safe_reply(update, "⏳ Testing proxy connection...")
+    try:
+        resp = await asyncio.to_thread(
+            requests.get,
+            "https://api.ipify.org",
+            proxies={"http": formatted_proxy, "https": formatted_proxy},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            await status_msg.edit_text(
+                f"❌ <b>Proxy Dead (HTTP {resp.status_code})</b>\nNot saved.",
+                parse_mode="HTML",
+            )
+            return
+        exit_ip = html.escape(resp.text.strip())
+    except Exception as e:
+        await status_msg.edit_text(
+            f"❌ <b>Proxy Dead or Unreachable</b>\n<code>{html.escape(str(e)[:140])}</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    await asyncio.to_thread(db_set_proxy, formatted_proxy)
+    await status_msg.edit_text(
+        f"✅ <b>Global Proxy Verified &amp; Updated!</b>\n"
+        f"• <b>Exit IP:</b> <code>{exit_ip}</code>\n"
+        f"• <b>Proxy:</b> <code>{html.escape(formatted_proxy)}</code>",
+        parse_mode="HTML",
+    )
 
 # ========== TEXT & FILE HANDLERS ==========
 CODE_PATTERN = re.compile(r"^XERO-[A-Z0-9]{4,12}(-[A-Z0-9]{4})?$", re.IGNORECASE)
