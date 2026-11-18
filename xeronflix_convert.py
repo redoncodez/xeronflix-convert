@@ -440,38 +440,88 @@ def parse_cookies_from_text(raw_text: str) -> dict:
     return cookies
     
 def mint_netflix_nftoken(cookie_dict: dict, proxies: dict | None = None) -> str | None:
-    """Mint a real single-use Netflix auto-login nftoken using Chrome TLS impersonation."""
-    s = curl_requests.Session(impersonate="chrome")
-    s.cookies.update(cookie_dict)
+    """Mint a single-use Netflix auto-login nftoken via iOS Argo API, with Chrome GraphQL fallback."""
+    netflix_id = cookie_dict.get("NetflixId")
+    if not netflix_id:
+        return None
 
-    graphql_url = "https://web.prod.cloud.netflix.com/graphql"
-    gql_headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "Origin": "https://www.netflix.com",
-        "Referer": "https://www.netflix.com/YourAccount",
+    clean_netflix_id = unquote(netflix_id)
+
+    # 1. Primary: iOS Argo endpoint (fast, bypasses web GraphQL persistedQuery rotations)
+    ios_headers = {
+        "User-Agent": "Argo/15.48.1 (iPhone; iOS 15.8.5; Scale/2.00)",
+        "x-netflix.request.routing": '{"path":"/nq/mobile/nqios/~15.48.0/user","control_tag":"iosui_argo"}',
+        "x-netflix.client.appversion": "15.48.1",
+        "x-netflix.client.type": "argo",
+        "x-netflix.context.ui-flavor": "argo",
+        "x-netflix.client.ftl.esn": "NFAPPL-02-IPHONE8=1-PXA-02026U9VV5O8AUKEAEO8PUJETCGDD4PQRI9DEB3MDLEMD0EACM4CS78LMD334MN3MQ3NMJ8SU9O9MVGS6BJCURM1PH1MUTGDPF4S4200",
+        "Cookie": f"NetflixId={clean_netflix_id}",
     }
+    ios_params = {
+        "appVersion": "15.48.1",
+        "device_type": "NFAPPL-02-",
+        "esn": "NFAPPL-02-IPHONE8%3D1-PXA-02026U9VV5O8AUKEAEO8PUJETCGDD4PQRI9DEB3MDLEMD0EACM4CS78LMD334MN3MQ3NMJ8SU9O9MVGS6BJCURM1PH1MUTGDPF4S4200",
+        "idiom": "phone",
+        "iosVersion": "15.8.5",
+        "model": "saget",
+        "modelType": "IPHONE8-1",
+        "path": '["account","token","default"]',
+        "responseFormat": "json",
+    }
+    try:
+        r = requests.get(
+            "https://ios.prod.ftl.netflix.com/iosui/user/15.48",
+            params=ios_params,
+            headers=ios_headers,
+            proxies=proxies,
+            timeout=15,
+        )
+        if r.status_code == 200:
+            data = r.json()
+            token = (
+                (((data.get("value") or {}).get("account") or {}).get("token") or {})
+                .get("default", {})
+                .get("token")
+            )
+            if isinstance(token, str) and len(token) > 20:
+                return token
+        logger.error(f"iOS nftoken failed ({r.status_code}): {r.text[:200]}")
+    except Exception as e:
+        logger.error(f"iOS nftoken exception: {e}")
 
-    for scope in ("WEBVIEW_MOBILE_STREAMING", "MOBILE_WEB"):
-        payload = {
-            "operationName": "CreateAutoLoginToken",
-            "variables": {"scope": scope},
-            "extensions": {
-                "persistedQuery": {
-                    "version": 102,
-                    "id": "76e97129-f4b5-41a0-a73c-12e674896849",
-                }
-            },
+    # 2. Fallback: Warmed Chrome TLS GraphQL endpoint
+    try:
+        s = curl_requests.Session(impersonate="chrome")
+        for k, v in cookie_dict.items():
+            s.cookies.set(k, v, domain=".netflix.com")
+        s.get("https://www.netflix.com/browse", proxies=proxies, timeout=15)
+
+        graphql_url = "https://web.prod.cloud.netflix.com/graphql"
+        gql_headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Origin": "https://www.netflix.com",
+            "Referer": "https://www.netflix.com/browse",
         }
-        try:
+        for scope in ("WEBVIEW_MOBILE_STREAMING", "MOBILE_WEB"):
+            payload = {
+                "operationName": "CreateAutoLoginToken",
+                "variables": {"scope": scope},
+                "extensions": {
+                    "persistedQuery": {
+                        "version": 102,
+                        "id": "76e97129-f4b5-41a0-a73c-12e674896849",
+                    }
+                },
+            }
             r = s.post(graphql_url, json=payload, headers=gql_headers, proxies=proxies, timeout=15)
             if r.status_code == 200:
-                token = ((r.json().get("data") or {}).get("createAutoLoginToken"))
+                token = (r.json().get("data") or {}).get("createAutoLoginToken")
                 if isinstance(token, str) and len(token) > 20:
                     return token
-            logger.warning(f"createAutoLoginToken ({scope}) failed ({r.status_code}): {r.text[:200]}")
-        except Exception as e:
-            logger.warning(f"createAutoLoginToken ({scope}) exception: {e}")
+            logger.error(f"GraphQL nftoken ({scope}) failed ({r.status_code}): {r.text[:200]}")
+    except Exception as e:
+        logger.error(f"GraphQL nftoken exception: {e}")
 
     return None
     
