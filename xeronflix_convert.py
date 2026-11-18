@@ -591,9 +591,7 @@ def check_netflix_cookie(cookie_dict: dict) -> dict | None:
         return None
 
 def build_login_links_fallback(cookie_dict: dict, source_label: str) -> dict | None:
-    netflix_id = cookie_dict.get("NetflixId")
-    if not netflix_id:
-        return None
+    return Nonee
     clean_id = unquote(netflix_id)
     return {
         "source": source_label,
@@ -753,19 +751,21 @@ async def process_redeem_code(update: Update, raw_code: str):
     await safe_edit(status_msg, "🔄 Order verified! Preparing your login links...")
 
     acct = await asyncio.to_thread(check_netflix_cookie, cookies)
-    if acct:
+        if not acct:
+            await safe_edit(
+                status_msg,
+                "❌ <b>Failed to generate auto-login token.</b>\n"
+                "The cookie may be expired or the active proxy/IP was blocked by Netflix.",
+            )
+            return
+
         acct["source"] = f"Order {order_code}"
-    else:
-        acct = build_login_links_fallback(cookies, f"Order {order_code}")
-
-    card_text, keyboard = build_single_card(acct)
-    await safe_edit(
-        status_msg,
-        "🎉 <b>Order Redeemed Successfully!</b>\n\n" + card_text,
-        reply_markup=keyboard,
-        disable_web_page_preview=True,
-    )
-
+        card_text, keyboard = build_single_card(acct)
+        await safe_edit(
+            status_msg,
+            "🎉 <b>Order Redeemed Successfully!</b>\n\n" + card_text,
+            reply_markup=keyboard,
+        )
 # ========== TELEGRAM COMMAND HANDLERS ==========
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
